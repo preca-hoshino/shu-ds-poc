@@ -1,0 +1,23 @@
+# ---- 凭据与运行产物（勿提交）----
+# login.py 产出的登录凭据（含 Cookie，等价于账号密码）
+.credentials*.json
+# 脱敏证据 / 诊断输出
+captures/
+# 本地抓包与逆向材料
+_analysis_bundle/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+# RSA 公钥自动抓取缓存
+.rsa_public_key.pem
+
+# ---- 环境变量（可放 PROXY_API_KEY / SHU_COOKIE 等）----
+.env
+
+# ---- OS / 编辑器 ----
+.DS_Store
+Thumbs.db

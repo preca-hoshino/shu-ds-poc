@@ -1,0 +1,15 @@
+# ---- 主脚本 poc.py（OpenAI 兼容代理）----
+fastapi>=0.115
+uvicorn[standard]>=0.32
+httpx>=0.27
+pydantic>=2.9
+
+# ---- 登录脚本 login.py（SSO，与 shu-sso-poc 一致）----
+requests>=2.32
+cryptography>=43
+
+# 可选：终端渲染企微二维码（未安装则降级为打印图片 URL）
+qrcode>=8.0
+
+# 可选：docs/scripts/test_openai_sdk.py 用（不装也能跑其它自测）
+# openai>=1.50
