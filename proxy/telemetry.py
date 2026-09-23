@@ -1,27 +1,9 @@
 """服务端控制台遥测：每个请求一行「输入状态」+ 一块「输出统计」。
 
-只写日志，不进响应体 —— 客户端拿到的仍是严格规范的 OpenAI 结构。
-logger 名与 `proxy/` 其余模块一致（`shu-ds-poc`），由 `poc.py` 接到 stdout，
-`--log-level` 决定是否显示（默认 `info` 就能看到）。
-
-输出样例::
-
-    → deepseek-v3  stream=true  消息=3  prompt=412 字符
-    ← 输出完毕
-      输入          224 tokens
-      输出          652 tokens
-      模型生成 TPS   66.0 tok/s
-      首 Token 耗时  1.20 s
-      端到端吞吐     24.4 tok/s
-      端到端耗时     35.88 s
-
-口径
-----
-- 「首 Token 耗时」= 请求发出 → 上游首个内容分片下发；非流式没有增量下发，
-  退化为上游响应头到达时刻（等同 TTFB）。
-- 「模型生成 TPS」= 输出 tokens / (首 Token → 结束)；生成窗口过短时不报数值。
-- 「端到端吞吐」= (输入 + 输出) tokens / 端到端耗时，含排队与传输开销。
-- tokens 取自上游 chatNode 统计；上游不给时按字符数估算，此时块头会标注。
+只写日志，不进响应体。口径：「首 Token 耗时」= 请求发出 → 首个内容分片下发
+（非流式退化为响应头到达，等同 TTFB）；「模型生成 TPS」= 输出 tokens ÷ 生成窗口
+（窗口过短不报值）；「端到端吞吐」= (输入 + 输出) ÷ 端到端耗时。tokens 取自上游
+chatNode 统计，缺失时按字符估算并标注。
 """
 
 from __future__ import annotations
@@ -46,21 +28,8 @@ def _tps(tokens: int, seconds: float) -> str:
 
 
 class RequestLog:
-    """单个请求的计时与统计。
-
-    用法::
-
-        rl = RequestLog(model, stream=req.stream, messages=len(req.messages),
-                        prompt_chars=sc.count_chars(req.messages))
-        rl.input_line()
-        ...                                    # 上游响应头到达
-        rl.mark_ttfb()
-        ...                                    # 流式：首个内容分片下发
-        rl.mark_first_token()
-        rl.finish(prompt_tokens, completion_tokens, estimated=False)
-
-    失败路径调 `fail()`，避免只打了输入行却没有下文。
-    """
+    """单个请求的计时与统计：`input_line()` → `mark_ttfb()` → `mark_first_token()`
+    → `finish()`；失败路径调 `fail()`，避免只打了输入行却没有下文。"""
 
     def __init__(self, model: str, *, stream: bool, messages: int,
                  prompt_chars: int) -> None:

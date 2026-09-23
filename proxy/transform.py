@@ -1,16 +1,8 @@
 """请求转换：OpenAI → 上游 FastGPT。
 
-映射关系（只在两边语义真的对应时才映射）：
-
-| OpenAI | 上游 |
-| :--- | :--- |
-| `messages[].role/content` | `messages[].{dataId, hideInUI, role, content}` |
-| `model` | 决定 `shareId`（R1 走独立分享链） |
-| `user` | `outLinkUid = shareChat-<user>`，缺省用随机 uuid |
-| `stream` | `stream` |
-
-其余参数（`temperature` / `max_tokens` / `tools` …）规范里有、但上游接口不接受，
-因此不下发 —— 见 `proxy/schemas.py` 的标注与 README。
+`messages[].role/content` → `messages[]{dataId, hideInUI, role, content}`；
+`model` 决定 `shareId`（R1 走独立分享链）；`user` → `outLinkUid`；`stream` → `stream`。
+其余规范参数（`temperature` / `max_tokens` / `tools` …）上游不接受，不下发。
 """
 
 from __future__ import annotations
@@ -31,14 +23,8 @@ def build_fastgpt_request(req: sc.ChatCompletionRequest, creds: dict,
                           model: str) -> fg.FastGptRequest:
     """把 OpenAI 请求转成上游请求体。
 
-    参数
-    ----
-    req
-        已校验的 OpenAI 请求。
-    creds
-        扁平字典，键：`share_id` / `user_id` / `access_token` / `private_key`。
-    model
-        **归一后的模型名**（`fg.resolve_model` 的结果），用于选分享链。
+    `creds` 是扁平字典：`share_id` / `user_id` / `access_token` / `private_key`；
+    `model` 是归一后的模型名（用于选分享链）。
     """
     return fg.FastGptRequest(
         messages=[fg.FastGptMessage(role=m.role, content=m.content)

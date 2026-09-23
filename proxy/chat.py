@@ -1,7 +1,7 @@
 """对话接口处理：请求校验 → 转换 → 上游 → 转换回来。
 
-对外只产出**规范形状**的数据：非流式是 OpenAI 响应字典，流式是 OpenAI SSE 文本。
-上游出问题时抛 `UpstreamError`，由服务层统一转成 OpenAI 错误体（HTTP 状态沿用上游）。
+对外只产出规范形状：非流式是 OpenAI 响应字典，流式是 OpenAI SSE 文本。
+上游出错抛 `UpstreamError`，由服务层转成 OpenAI 错误体（状态码沿用上游）。
 """
 
 from __future__ import annotations
@@ -99,7 +99,7 @@ async def acompletion(upstream: Upstream, req: sc.ChatCompletionRequest) -> dict
 async def _closing_bytes(resp: httpx.Response) -> AsyncIterator[bytes]:
     """上游字节流，并在**任何**退出路径上释放连接。
 
-    客户端中途断开时 Starlette 会取消这个生成器，`finally` 保证上游连接不泄漏。
+    客户端中途断开时 Starlette 会取消这个生成器，`finally` 保证连接不泄漏。
     """
     try:
         async for chunk in resp.aiter_bytes():

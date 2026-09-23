@@ -1,8 +1,4 @@
-"""终端交互界面：横幅、菜单、二维码、结果汇总、错误提示。
-
-本地实现（上游 `src/ui.py` 是原项目「批量登录多系统」的文案，这里随本 POC 收敛）。
-二维码渲染仍用子模块的 `sso.qr`（= `src.qr`）。
-"""
+"""终端交互界面：横幅、菜单、二维码、结果汇总、错误提示。"""
 
 from __future__ import annotations
 
@@ -69,7 +65,7 @@ def pad(text: str, width: int) -> str:
 
 
 def result_detail(r: dict) -> str:
-    """为汇总行挑一段可读详情：成功看落地 URL，失败优先看原因/错误信息。"""
+    """为汇总行挑一段可读详情：成功看落地 URL，失败优先看原因 / 错误信息。"""
     if r.get("logged_in"):
         return r.get("final_url") or ""
     if r.get("reason") == "exception":
@@ -110,8 +106,8 @@ def print_error_hint(msg: str | None) -> None:
 def print_wecom_qr(confirm_url: str, args) -> bool:
     """在终端渲染扫码二维码，返回是否渲染成功。
 
-    三重保护：`--no-qr` 关闭 / 输出非 TTY 时跳过（ANSI 码会污染重定向的文件）/
-    未装 qrcode 时返回 False（由调用方回退到打印图片 URL）。
+    `--no-qr` 关闭；输出非 TTY 时跳过（ANSI 码会污染重定向的文件）；未装 qrcode 库时
+    返回 False（调用方回退到打印图片 URL）。
     """
     if getattr(args, "no_qr", False):
         log("     （已按 --no-qr 关闭终端二维码）")

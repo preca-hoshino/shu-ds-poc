@@ -2,16 +2,11 @@
 # -*- coding: utf-8 -*-
 """主脚本：起一个 OpenAI 兼容 API，把请求转到上游（aiagent.shu.edu.cn）。
 
-    读凭据(.credentials.json) → 起 FastAPI →
-    客户端 POST /v1/chat/completions → 转换 → 上游 → 转回 OpenAI 格式
+    读凭据 → 起 FastAPI → POST /v1/chat/completions → 转换 → 上游 → 转回 OpenAI
 
-只暴露两个端点（与 OpenAI 一致）：
-    POST /v1/chat/completions
-    GET  /v1/models
+只暴露 `POST /v1/chat/completions` 与 `GET /v1/models`。
 
-用法:
-    python poc.py                      # 默认 127.0.0.1:3000
-    python poc.py --port 8080 --host 0.0.0.0
+用法: python poc.py [--port 8080 --host 0.0.0.0]
 """
 
 from __future__ import annotations
@@ -37,8 +32,8 @@ def env_api_key() -> str:
 def setup_logging(level: str) -> None:
     """把本项目的 logger 接到 stdout。
 
-    uvicorn 的日志配置只管它自己的 logger，项目的 `shu-ds-poc` logger 不接一下
-    就落在没有 handler 的 root 上 —— INFO 级别的请求遥测会直接丢掉。
+    uvicorn 只配置它自己的 logger，不接一下的话项目 logger 的 INFO 遥测会掉在
+    没有 handler 的 root 上被丢掉。
     """
     numeric = getattr(logging, level.upper(), None)
     if not isinstance(numeric, int):
@@ -52,7 +47,7 @@ def setup_logging(level: str) -> None:
 
 
 def banner(args, creds: dict) -> None:
-    """打印启动信息（**不含 Cookie 明文**）。"""
+    """打印启动信息（不含 Cookie 明文）。"""
     cookie = creds_mod.cookie_header(creds)
     cookie_items = len([c for c in cookie.split(";") if c.strip()]) if cookie else 0
     base = args.base or creds_mod.upstream_base(creds)

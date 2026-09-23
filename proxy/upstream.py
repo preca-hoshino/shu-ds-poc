@@ -39,11 +39,7 @@ class UpstreamError(RuntimeError):
 
 
 class Upstream:
-    """上游（aiagent.shu.edu.cn）客户端。
-
-    持有长效 `httpx.AsyncClient` 与一份凭据快照。凭据可在运行期用
-    `reload()` 热更新（Cookie 过期后不必重启服务）。
-    """
+    """上游（aiagent.shu.edu.cn）客户端：长效 `httpx.AsyncClient` + 凭据快照。"""
 
     def __init__(self, creds: dict, *, base: str | None = None, timeout: float = 300.0,
                  verify: bool = False, chat_path: str | None = None) -> None:
@@ -94,18 +90,11 @@ class Upstream:
     async def chat(self, payload: fg.FastGptRequest) -> httpx.Response:
         """POST 上游对话接口，返回**未读取正文**的响应对象。
 
-        必须用 `send(request, stream=True)`，不能用 `client.post()`：httpx 的便捷
-        方法会把响应体整段读完才返回，此后 `aiter_bytes()` 只是在回放内存里的字节，
-        流式会被吃成一次性下发（实测帧到达跳度 0.000s、TTFB == 总耗时）。
+        必须用 `send(request, stream=True)`：`client.post()` 会把响应体整段读完才返回，
+        之后 `aiter_bytes()` 只是回放内存字节，流式被吃成一次性下发。
 
-        调用方负责读取并释放：
-
-        | 场景 | 读法 | 释放 |
-        | :--- | :--- | :--- |
-        | 非流式 | `await resp.aread()` | `await resp.aclose()` |
-        | 流式 | `async for c in resp.aiter_bytes()` | 读完自动释放 |
-
-        出错时抛 `UpstreamError`，保留上游的状态码与正文（非 2xx 原样透传）。
+        调用方负责读取并释放：非流式 `aread()` + `aclose()`；流式读完自动释放。
+        非 2xx 抛 `UpstreamError`，保留上游状态码与正文（原样透传）。
         """
         headers = self.headers(payload.share_id)
         body = payload.model_dump(by_alias=True, exclude_none=True)

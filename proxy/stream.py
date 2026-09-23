@@ -1,27 +1,13 @@
 """流式响应转换：上游 SSE → OpenAI SSE。
 
-上游事件格式（每帧 `event: <类型>` + `data: <JSON>`，空行分隔）：
+上游事件：`answer`（正文 / 推理增量）、`flowNodeResponse`（chatNode 节点带真实
+token 数、`reasoningText`、`finishReason`）、`flowNodeStatus`（忽略）。
 
-    event: answer            ← 正文 / 推理增量，取 choices[0].delta
-    event: flowNodeResponse  ← 节点统计，moduleType == "chatNode" 时带真实 token 数
-                                与整段推理链（`reasoningText`）/ 完成原因（`finishReason`）
-    event: flowNodeStatus    ← 节点状态，忽略
+下发帧序列与 OpenAI 一致：role 帧 → 内容 / 推理帧 → `delta:{}`+`finish_reason`
+→ usage 帧（仅 `stream_options.include_usage`）→ `[DONE]`。
 
-下发给客户端的帧序列**与 OpenAI 完全一致**：
-
-    data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}
-    data: {"choices":[{"index":0,"delta":{"reasoning_content":"…"},"logprobs":null,"finish_reason":null}]}
-    data: {"choices":[{"index":0,"delta":{"content":"你"},"logprobs":null,"finish_reason":null}]}
-    ...
-    data: {"choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}]}
-    data: {"choices":[],"usage":{...}}          ← 仅当 stream_options.include_usage
-    data: [DONE]
-
-推理链（思维链）走 DeepSeek 的 `reasoning_content`：
-  - 上游在 `answer` 增量里给 `reasoning_content` → 原样转出（可能夹在正文之前）；
-  - 上游只在收尾的 chatNode 统计里给 `reasoningText` → 在 `finish_reason` 帧**之前**
-    补一帧 `reasoning_content`（上游不给增量时，这是唯一能拿到推理链的时机，
-    客户端仍能把它渲染成思考块）。
+推理链走 `reasoning_content`：上游给增量就原样转出；只在收尾统计里给了
+`reasoningText` 时，在 `finish_reason` 帧之前补一帧。
 """
 
 from __future__ import annotations
@@ -43,17 +29,7 @@ DONE = "data: [DONE]\n\n"
 
 
 class FrameSplitter:
-    """增量式 SSE 分帧器。
-
-    用法::
-
-        sp = FrameSplitter()
-        for raw in chunks:              # 网络分片，切点任意
-            for frame in sp.feed(raw):
-                ...
-
-    跨分片的残帧会被保留；同时支持 `\\n\\n` 与 `\\r\\n\\r\\n`。
-    """
+    """增量式 SSE 分帧器：跨分片的残帧保留，`\\n\\n` 与 `\\r\\n\\r\\n` 都认。"""
 
     def __init__(self) -> None:
         self._buf = b""
@@ -108,10 +84,7 @@ def _sse(payload: dict[str, Any]) -> str:
 
 def _chunk(model: str, created: int, delta: dict[str, Any],
            finish_reason: str | None = None) -> str:
-    """构造一个 `chat.completion.chunk`。
-
-    `logprobs` 与 `finish_reason` 显式给 `null` —— OpenAI 的每一帧都带这两个键。
-    """
+    """构造一个 `chat.completion.chunk`；`logprobs` / `finish_reason` 显式给 null。"""
     return _sse({
         "id": f"chatcmpl-{uuid.uuid4()}",
         "object": "chat.completion.chunk",
@@ -233,16 +206,7 @@ async def translate_stream(byte_iter: AsyncIterator[bytes],
                            telemetry: tm.RequestLog | None = None) -> AsyncIterator[str]:
     """把上游字节流翻译成 OpenAI SSE 文本流。
 
-    参数
-    ----
-    byte_iter
-        上游响应的字节迭代器（`resp.aiter_bytes()`）。
-    req
-        原始请求（取 `stream_options.include_usage` 与用于估算的 prompt 字符数）。
-    model
-        返回给客户端的模型名（回显请求里的那个）。
-    telemetry
-        控制台遥测（可空）。给了就在首个内容分片下发时打点、流结束时打统计。
+    `telemetry` 非空时：首个内容分片下发时打点，流结束时（含客户端断开）打统计。
     """
     created = int(time.time())
     prompt_chars = sc.count_chars(req.messages)
@@ -251,7 +215,7 @@ async def translate_stream(byte_iter: AsyncIterator[bytes],
     splitter = FrameSplitter()
 
     def tokens() -> tuple[int, int, bool]:
-        """(输入, 输出, 是否为字符估算)。上游 chatNode 统计优先。"""
+        """(输入, 输出, 是否估算)。上游 chatNode 统计优先。"""
         estimated = stats.actual_prompt is None or stats.actual_completion is None
         return (
             stats.actual_prompt if stats.actual_prompt is not None
@@ -262,7 +226,7 @@ async def translate_stream(byte_iter: AsyncIterator[bytes],
         )
 
     def note() -> None:
-        """标记首个内容分片已下发（遥测用，重复调用只生效一次）。"""
+        """标记首个内容分片已下发（重复调用只生效一次）。"""
         if telemetry is not None:
             telemetry.mark_first_token()
 

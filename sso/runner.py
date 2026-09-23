@@ -1,9 +1,7 @@
 """批量登录：用已建立的 SSO 会话向业务系统换取授权。
 
-要登哪几个系统由 `sso/config.py` 的 `SYSTEMS` 决定（默认只有 `ds`，可用环境变量
-`SHU_SSO_SYSTEMS` 放开）—— 上游子模块里另有 bbs/jwxt/otp/webvpn 四套配置，
-本 POC 不去换它们的会话（省时间、少噪声）。通用/专属双路径结构沿用上游：
-`systems/<域名>/client.py` 有实现就用它，否则走「授权取码 → 跟随 302」。
+要登哪几个由 `config.SYSTEMS` 决定（默认只有 `ds`，`SHU_SSO_SYSTEMS` 可放开）。
+`systems/<域名>/client.py` 有实现就用，否则走通用的「授权取码 → 跟随 302」。
 """
 
 from __future__ import annotations
@@ -25,8 +23,7 @@ def total_systems() -> int:
 def session_params(system: dict | None = None) -> str:
     """拼 `/oauth/userLogin` 的 `params`（base64url）。
 
-    服务端只校验格式、不关心是哪个业务系统，故取任一已注册系统即可
-    —— 避免单个系统的配置问题连登录都做不成。
+    服务端只校验格式、不关心是哪个系统，故取任一已注册系统即可。
     """
     if not config.SYSTEMS:
         raise RuntimeError("未装载任何业务系统（检查 SHU_SSO_SYSTEMS 与子模块 systems/ 目录）")
@@ -42,12 +39,9 @@ def session_params(system: dict | None = None) -> str:
 
 
 def login_all_systems(client: ShuSSO, username: str = "") -> dict[str, dict]:
-    """依次登录全部系统。
+    """依次登录全部系统，返回 {system_key: 换会话结果}。
 
-    **各系统彼此独立**：任一系统出错（网络异常、上游改版、接口报错等）只记为该
-    系统失败，不中断其余系统；仅 Ctrl+C 会向上抛出。
-
-    返回 {system_key: 换会话结果}。
+    各系统彼此独立：任一失败只记为该系统失败，不中断其余；仅 Ctrl+C 向上抛。
     """
     log(f"\n[OAuth ①③④] 用同一 SSO 会话依次登录 {total_systems()} 个系统...\n")
     results: dict[str, dict] = {}
@@ -73,9 +67,9 @@ def login_all_systems(client: ShuSSO, username: str = "") -> dict[str, dict]:
 
 
 def login_one(ctx: RedeemContext) -> dict:
-    """登录单个业务系统：有专属实现就用它，否则走通用路径。
+    """登录单个系统：有专属实现就用，否则走通用路径。
 
-    各类失败都收敛为 {"logged_in": False, "reason": ...} 而不抛出，便于逐系统隔离。
+    各类失败都收敛为 {"logged_in": False, "reason": ...} 而不抛出。
     """
     impl = registry.redeem_impl(ctx.key)
     return impl(ctx) if impl else _login_generic(ctx)

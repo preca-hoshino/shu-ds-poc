@@ -1,14 +1,7 @@
-"""FastAPI 服务：**只暴露 OpenAI 的端点**。
+"""FastAPI 服务：只暴露 `/v1/chat/completions` 与 `/v1/models`。
 
-    POST /v1/chat/completions   对话（流式 / 非流式）
-    GET  /v1/models             模型列表
-
-除此之外没有任何路由 —— FastAPI 自带的 `/docs`、`/redoc`、`/openapi.json`
-也一并关掉，保证 API 面与 OpenAI 一致。
-
-鉴权、错误体、状态码全部按 OpenAI 规范：
-    Authorization: Bearer <api key>
-    {"error": {"message", "type", "param", "code"}}
+FastAPI 自带的 `/docs` / `/redoc` / `/openapi.json` 一并关掉，API 面与 OpenAI 一致。
+鉴权 `Authorization: Bearer <key>`；错误体 `{"error": {message, type, param, code}}`。
 """
 
 from __future__ import annotations

@@ -1,12 +1,8 @@
-"""本 POC 的配置：上游常量透传 + 自己那几个值。
+"""本 POC 的配置：协议常量透传自子模块，其余是本地的。
 
-- `SSO_BASE` / `DEFAULT_TENANT` / `WECOM` 等协议常量直接来自子模块（`src.config`），
-  不复制一份 —— 上游改参数时这里立刻跟着变；
-- `AIA_*` / shareId / `CAPTURE_DIR` 是本 POC 的东西，上游没有；
-- `SYSTEMS` 由上游 `registry.load_systems()` 从子模块的 `systems/` 装出来，
-  再按需裁剪（默认只留 `ds`）：本 POC 只需要「换到 ds 会话」来保证身份可用。
-
-导入本模块不会联网（RSA 公钥抓取在 `rsa_key`，首次使用时才发生）。
+`SSO_BASE` / `DEFAULT_TENANT` / `WECOM` 来自 `src.config`（不复制，上游改参数这里跟着变）；
+`AIA_*` / shareId / `CAPTURE_DIR` 是本 POC 的东西；`SYSTEMS` 由上游 `registry.load_systems()`
+装出再裁剪（默认只留 `ds`）。导入本模块不联网。
 """
 
 from __future__ import annotations

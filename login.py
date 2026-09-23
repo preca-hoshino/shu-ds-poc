@@ -1,44 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""登录脚本：完成统一身份认证 → 换取 ds 会话 → 产出凭据 `.credentials.json`。
-
-流程（认证部分由子模块 shu-sso-poc 实现，本项目只把「批量登录多系统」收敛到
-「拿到代理要用的凭据」）：
+"""登录脚本：统一身份认证 → 换取 ds 会话 → 产出凭据 `.credentials.json`。
 
     ① 认证    账号密码（RSA 加密）+ 可选两步验证   —— 或 ——   企业微信扫码
     ② 换会话  GET /oauth/authorize 取 code → ds 后端 getSsoUser 换 token
-    ③ 引导    用已建立的 shu.edu.cn Cookie 探一次 aiagent.shu.edu.cn，
-              尽量把它自己下发的 Cookie 也收进来（失败只记录，不中断）
-    ④ 落盘    写出 `.credentials.json`（0600），供 poc.py 读取
+    ③ 落盘    写出 `.credentials.json`（0600），供 poc.py 读取
 
-安全：密码经 getpass 读取，不落盘、不打印；证据 JSON 走脱敏，
-      凭据文件含 Cookie（等价于登录态），已在 .gitignore 中忽略。
-
-用法:
-    python login.py                       # 交互式（推荐）
-    python login.py --login password      # 账号密码 + 两步验证
-    python login.py --login wecom_scan    # 企业微信扫码
-    python login.py --method sms          # 账号密码模式指定 2FA 方式
-    python login.py --cookie "uname=..."  # 手工粘贴 Cookie（跳过认证环节的兜底路径）
-    python login.py --check               # 用已有凭据复探上游，不重新登录
+认证部分由子模块 shu-sso-poc 实现。密码经 getpass 读取，不落盘、不打印；
+证据 JSON 走脱敏；凭据含 Cookie，已在 .gitignore 中忽略。
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import getpass
 import os
 import sys
 from datetime import datetime
 
 from proxy import credentials as creds_mod
+from proxy import fastgpt as fg
+from proxy import schemas as sc
+from proxy import transform as tf
+from proxy import upstream as up_mod
 from sso import config
-from sso.aiagent import bootstrap_aiagent, probe_cookies
 from sso.client import ShuSSO
 from sso.runner import login_all_systems, save_evidence, session_params
 from sso.ui import (banner, choose_login_mode, print_error_hint, print_summary,
                     print_wecom_qr)
-from sso.utils import (log, mask_cookie_header, rsa_encrypt_password, save_json)
+from sso.utils import log, rsa_encrypt_password, save_json
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +46,77 @@ def _pick(d: dict, *keys: str) -> str:
     return ""
 
 
-def build_credentials(client: ShuSSO, ds_result: dict, aia: dict,
+# ---------------------------------------------------------------------------
+# 上游探活
+# ---------------------------------------------------------------------------
+
+#: 探活用的最小请求（一个词、非流式，尽量少占用上游）
+_PROBE_MODEL = "deepseek-v3"
+_PROBE_TEXT = "ping"
+
+
+def _reply_text(raw: str) -> str:
+    """从上游响应里取回答正文（取不到就返回空串）。"""
+    try:
+        return fg.parse_content(fg.FastGptResponse.model_validate_json(raw))[0][:60]
+    except Exception:                                  # noqa: BLE001 - 只用于展示
+        return ""
+
+
+def probe_upstream(creds: dict, base: str | None = None,
+                   timeout: float = 60.0) -> dict:
+    """用这份凭据真发一次最小对话请求，看上游认不认（不抛异常）。
+
+    上游不校验 Cookie，只认分享链与请求形状，所以「能不能用」只能真发一次请求；
+    请求由 `proxy.transform` 拼出，与 `poc.py` 下发的完全一致。
+    """
+    payload = tf.build_fastgpt_request(
+        sc.ChatCompletionRequest.model_validate({
+            "model": _PROBE_MODEL,
+            "messages": [{"role": "user", "content": _PROBE_TEXT}],
+        }),
+        {"share_id": creds_mod.share_id(creds),
+         "user_id": creds_mod.user_id(creds),
+         "access_token": creds_mod.access_token(creds),
+         "private_key": creds_mod.private_key(creds)},
+        _PROBE_MODEL,
+    )
+
+    async def run() -> dict:
+        up = up_mod.Upstream(creds, base=base, timeout=timeout, verify=True)
+        try:
+            resp = await up.chat(payload)
+            try:
+                raw = (await resp.aread()).decode("utf-8", "replace")
+            finally:
+                await resp.aclose()
+            return {"ok": True, "http_status": resp.status_code,
+                    "chars": len(raw), "reply": _reply_text(raw)}
+        except up_mod.UpstreamError as exc:
+            return {"ok": False, "http_status": exc.status_code,
+                    "error": str(exc), "body": exc.body[:300]}
+        except Exception as exc:                       # noqa: BLE001 - 诊断不致命
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            await up.aclose()
+
+    return asyncio.run(run())
+
+
+def _print_probe(probe: dict) -> None:
+    """把探活结果打成人话。"""
+    if not probe["ok"]:
+        reason = probe.get("error") or f"HTTP {probe.get('http_status')}"
+        log(f"  ✗ 上游不可用：{reason}")
+        if probe.get("body"):
+            log(f"     {probe['body']}")
+        return
+    log(f"  ✓ HTTP {probe['http_status']}，上游正常应答（{probe['chars']} 字节）")
+    if probe.get("reply"):
+        log(f"     模型回：{probe['reply']}")
+
+
+def build_credentials(client: ShuSSO, ds_result: dict,
                       args, username: str = "") -> dict:
     """把本次登录的成果整理成凭据结构。"""
     sso_cookies = client.cookies("shu.edu.cn") or client.cookies()
@@ -63,10 +124,6 @@ def build_credentials(client: ShuSSO, ds_result: dict, aia: dict,
 
     ds_result = ds_result or {}
     raw = ds_result.get("raw_user") or {}
-
-    # 上游请求优先用「探测后」的 Cookie（含上游自己下发的那部分），
-    # 探测失败时退回认证侧 Cookie —— 至少让 poc.py 能发出请求便于排查。
-    cookie_header = (aia or {}).get("cookie_header") or sso_header
 
     return {
         "version": 1,
@@ -79,21 +136,14 @@ def build_credentials(client: ShuSSO, ds_result: dict, aia: dict,
             "chat_path": config.AIA_CHAT_PATH,
         },
         "share_id": os.getenv("SHU_SHARE_ID") or config.DEFAULT_SHARE_ID,
-        "cookie_header": cookie_header,
-        "cookies": (aia or {}).get("cookies") or sso_cookies,
-        "sso_cookies": sso_cookies,
+        "cookie_header": sso_header,
+        "cookies": sso_cookies,
         "ds": {
             "userid": _pick(raw, "userid", "userId") or ds_result.get("user_id"),
             "name": _pick(raw, "username", "name") or ds_result.get("username"),
             "access_token": _pick(raw, "accessToken", "access_token"),
             "private_key": _pick(raw, "privatekey", "privateKey", "private_key"),
             "raw": raw,
-        },
-        "aiagent": {
-            "ok": bool((aia or {}).get("ok")),
-            "seeded": (aia or {}).get("seeded") or [],
-            "oauth_params": (aia or {}).get("oauth_params"),
-            "hint": (aia or {}).get("hint"),
         },
     }
 
@@ -106,7 +156,6 @@ def write_credentials(args, payload: dict) -> int:
         log(f"\n  ✗ 凭据写入失败（{type(exc).__name__}: {exc}）")
         return 9
 
-    aia_ok = payload["aiagent"]["ok"]
     log("")
     log("=" * 62)
     log(" 凭据已生成")
@@ -116,52 +165,37 @@ def write_credentials(args, payload: dict) -> int:
         f"{'  ' + payload['display_name'] if payload['display_name'] else ''}")
     log(f"   上游       : {payload['upstream']['base']}")
     log(f"   Cookie 项数: {len([c for c in payload['cookie_header'].split(';') if c.strip()])}")
-    log(f"   上游会话   : {'✓ 已换到上游 Cookie' if aia_ok else '✗ 仅 SSO Cookie（见下方提示）'}")
     log("=" * 62)
-    if payload["aiagent"].get("hint"):
-        log("")
-        log(f"  ! {payload['aiagent']['hint']}")
     log("")
     log(" 下一步：.venv/Scripts/python.exe poc.py    # 起 OpenAI 兼容服务")
     log("         .venv/Scripts/python.exe login.py --check   # 复探上游，确认凭据可用")
     return 0
 
 
-def build_evidence(client: ShuSSO, results: dict, aia: dict, args,
+def build_evidence(client: ShuSSO, results: dict, args,
                    username: str = "", **extra) -> None:
     """把本次运行的脱敏证据写入 captures/。"""
     path = save_evidence("login-result.json", client, results,
-                         tenant=args.tenant, username=username,
-                         aiagent={k: v for k, v in (aia or {}).items()
-                                  if k in ("base", "seeded", "ok", "hint",
-                                           "oauth_params", "probes")},
-                         **extra)
+                         tenant=args.tenant, username=username, **extra)
     log(f"\n证据已保存: {path}（密码 / 授权码 / 令牌已脱敏）")
 
 
 # ---------------------------------------------------------------------------
-# 收尾：换会话 → 探上游 → 落盘
+# 收尾：换会话 → 落盘
 # ---------------------------------------------------------------------------
 
 def finalize(client: ShuSSO, args, username: str = "", **evidence_extra) -> int:
-    """登录成功后的公共收尾：登录业务系统 → 探上游 → 写凭据。"""
+    """登录成功后的公共收尾：登录业务系统 → 写凭据。"""
     results = login_all_systems(client, username=username)
     print_summary(results)
 
     ds_result = results.get("ds") or {}
     if not ds_result.get("logged_in"):
         log("\n  ! ds 未登录成功 —— 业务系统换会话失败，但认证会话本身可能仍然可用；"
-            "下面继续探上游并写出凭据，便于排查。")
+            "下面继续写出凭据，便于排查。")
 
-    aia: dict = {"ok": False}
-    if args.no_bootstrap:
-        log(f"\n[上游] 已按 --no-bootstrap 跳过 {args.base} 探测")
-    else:
-        log(f"\n[上游] 探测 {args.base} 并尝试建立会话 ...")
-        aia = bootstrap_aiagent(client, base=args.base)
-
-    payload = build_credentials(client, ds_result, aia, args, username=username)
-    build_evidence(client, results, aia, args, username=username, **evidence_extra)
+    payload = build_credentials(client, ds_result, args, username=username)
+    build_evidence(client, results, args, username=username, **evidence_extra)
     return write_credentials(args, payload)
 
 
@@ -349,16 +383,6 @@ def cookie_flow(args) -> int:
         print("错误：--cookie 不能为空")
         return 1
 
-    log("\n[手工 Cookie] 探测上游，确认这串 Cookie 可用 ...")
-    probe = probe_cookies(header, base=args.base)
-    if not probe.get("ok"):
-        log(f"  ✗ 探测失败：{probe.get('error')}")
-        return 6
-    log(f"  ✓ HTTP {probe['http_status']} → {probe['final_url'][:80]}")
-    log(f"     种入 {len(probe['sent'])} 项，探测后 {len(probe['cookies'])} 项"
-        f"（新增：{', '.join(probe['new_cookies']) or '无'}）")
-    log(f"     Cookie: {mask_cookie_header(probe['cookie_header'])}")
-
     payload = {
         "version": 1,
         "created_at": datetime.now().isoformat(),
@@ -367,43 +391,41 @@ def cookie_flow(args) -> int:
         "display_name": "",
         "upstream": {"base": args.base, "chat_path": config.AIA_CHAT_PATH},
         "share_id": os.getenv("SHU_SHARE_ID") or config.DEFAULT_SHARE_ID,
-        "cookie_header": probe["cookie_header"],
-        "cookies": probe["cookies"],
-        "sso_cookies": {},
-        "ds": {"userid": "", "name": "", "access_token": "", "private_key": "", "raw": {}},
-        "aiagent": {"ok": bool(probe["new_cookies"]),
-                    "seeded": probe["sent"],
-                    "oauth_params": None,
-                    "hint": "手工 Cookie 模式：若上游接口报鉴权失败，请重新抓包更新。"},
+        "cookie_header": header,
+        "cookies": dict(i.strip().split("=", 1) for i in header.split(";") if "=" in i),
+        "ds": {"userid": os.getenv("SHU_USER_ID") or "",
+               "name": "", "access_token": os.getenv("SHU_ACCESS_TOKEN") or "",
+               "private_key": os.getenv("SHU_PRIVATE_KEY") or "", "raw": {}},
         "source": "manual-cookie",
     }
-    save_json("login-manual-cookie.json",
-              {"probe": probe, "cookie_header": probe["cookie_header"]})
+
+    log(f"\n[手工 Cookie] 向上游发一次最小请求，确认这份凭据可用 ...")
+    log(f"  {creds_mod.describe(payload, args.out)}")
+    probe = probe_upstream(payload, base=args.base)
+    _print_probe(probe)
+    if not probe["ok"]:
+        return 6
+
+    save_json("login-manual-cookie.json", {"probe": probe})
     return write_credentials(args, payload)
 
 
 def check_flow(args) -> int:
-    """用已有凭据复探上游（不重新登录），判断凭据是否还能用。"""
+    """用已有凭据真发一次最小请求，判断凭据是否还能用。"""
     try:
         creds = creds_mod.load(args.out)
     except creds_mod.CredentialsError as exc:
         log(f"\n  ✗ {exc}")
         return 9
 
-    log("\n[复探] 用已有凭据探上游 ...")
+    log("\n[复探] 用已有凭据向上游发一次最小请求 ...")
     log(f"  {creds_mod.describe(creds, args.out)}")
 
-    probe = probe_cookies(creds_mod.cookie_header(creds, args.out), base=args.base)
-    if not probe.get("ok"):
-        log(f"  ✗ 探测失败：{probe.get('error')}")
+    probe = probe_upstream(creds, base=args.base)
+    _print_probe(probe)
+    if not probe["ok"]:
+        log("\n 凭据或分享链可能已失效，重新运行 python login.py 即可。")
         return 6
-    log(f"  ✓ HTTP {probe['http_status']} → {probe['final_url'][:80]}")
-    if probe["new_cookies"]:
-        log(f"     上游下发了新 Cookie：{', '.join(probe['new_cookies'])}")
-        log("     （如需更新凭据，重新运行 python login.py）")
-
-    log("\n 提示：Cookie 能不能真的用，最终要看上游接口的返回；")
-    log("       跑一次 docs/scripts/test_nonstream.py 最准（会真发一次最小请求）。")
     return 0
 
 
@@ -430,12 +452,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"凭据输出路径（默认 {creds_mod.DEFAULT_PATH}）")
     p.add_argument("--base", default=config.AIA_BASE,
                    help=f"上游站点根地址（默认 {config.AIA_BASE}）")
-    p.add_argument("--no-bootstrap", action="store_true",
-                   help="跳过对上游站点的探测（只拿 SSO 侧 Cookie）")
     p.add_argument("--cookie", default=None,
                    help="手工粘贴的 Cookie 串（跳过 SSO 登录，兜底路径）")
     p.add_argument("--check", action="store_true",
-                   help="用已有凭据复探上游，不重新登录")
+                   help="用已有凭据真发一次最小请求，确认还能用（不重新登录）")
     return p
 
 

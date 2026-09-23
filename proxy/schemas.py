@@ -1,8 +1,4 @@
-"""OpenAI Chat Completions 请求模型与错误体。
-
-只放 [OpenAI 规范](https://platform.openai.com/docs/api-reference/chat) 里定义的东西；
-上游（FastGPT）专有的概念一律不在这里出现。
-"""
+"""OpenAI Chat Completions 请求模型与错误体（只放规范里定义的东西）。"""
 
 from __future__ import annotations
 
@@ -62,8 +58,7 @@ class StreamOptions(BaseModel):
 class ChatCompletionRequest(BaseModel):
     """`POST /v1/chat/completions` 的请求体。
 
-    字段与规范一一对应。**上游接口不接受、因而不会下发的参数**照常接受
-    （见下面标注），只是对结果没有影响；规范之外的字段（供应商扩展）同样接受并忽略。
+    上游不接受的参数照常接受但不下发；规范外字段（供应商扩展）接受并忽略。
     """
 
     model_config = ConfigDict(extra="allow")

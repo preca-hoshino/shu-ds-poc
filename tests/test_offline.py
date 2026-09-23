@@ -2,22 +2,10 @@
 # -*- coding: utf-8 -*-
 """离线自检（不联网）：模块装配 + 转换 / 解析 / 规范形状。
 
-覆盖：
-    1. sso 包导入与系统注册表
-    2. 凭据文件读写与取值优先级
-    3. 模型名校验与别名
-    4. OpenAI → 上游请求构造
-    5. 上游响应 → OpenAI 响应（字段与规范一致）
-    6. usage（上游占位值时改用估算）
-    7. SSE 分帧器（两种分隔符 + 跨分片残帧）
-    8. 流式帧序列（首帧 role / 收尾 finish_reason / usage 帧 / [DONE]）
-    9. 流式推理链（增量 reasoning_content / 收尾 reasoningText 兜底 / finishReason 映射）
-   10. 上游连接必须真流式（不是 httpx 便捷方法那种预读整段正文）
-   12. sso 本地层与上游子模块的接口契约（`sso.*` ← `vendor/shu-sso-poc/src/*`）
-   13. 控制台遥测（一行输入状态 + 一块输出统计）
+覆盖：sso 注册表、凭据、模型校验、请求转换、响应形状、usage、SSE 分帧、
+流式帧序列与推理链、上游真流式、sso 子模块契约、控制台遥测。
 
-用法:
-    .venv\\Scripts\\python.exe tests\\test_offline.py
+用法: .venv\\Scripts\\python.exe tests\\test_offline.py
 """
 
 from __future__ import annotations
@@ -498,9 +486,8 @@ class _AsyncGenStream(httpx.AsyncByteStream):
 def test_upstream_streaming() -> None:
     """上游连接必须真流式。
 
-    回归点：`Upstream.chat` 曾经用 `client.post()`（httpx 便捷方法），它会把响应体
-    整段读完才返回，此后 `aiter_bytes()` 只是在回放内存里的字节 —— 表现为所有 SSE 帧
-    同时到达、TTFB == 总耗时，客户端看起来就是“没有流式”。
+    回归点：`Upstream.chat` 曾用 `client.post()`，它预读整段正文，之后 `aiter_bytes()`
+    只是回放内存 —— 表现为所有 SSE 帧同时到达、TTFB == 总耗时。
     """
     print("\n[11] 上游连接必须真流式")
     produced: list[int] = []
@@ -612,8 +599,7 @@ async def _collect_with_telemetry(raw: bytes) -> list[str]:
 def test_telemetry() -> None:
     """[13] 控制台遥测：请求进来一行输入状态，输出完毕一块统计。
 
-    只校验**日志文本**（遥测不进响应体）—— 客户端拿到的仍是规范结构，
-    这条由 [5]/[9] 的字段断言卡着。
+    只校验**_日志文本**（遥测不进响应体）；响应仍是规范结构，由 [5]/[9] 卡着。
     """
     print("\n[13] 控制台遥测（输入状态 / 输出统计）")
 
@@ -702,10 +688,9 @@ def test_telemetry() -> None:
 def test_sso_submodule() -> None:
     """[12] 本地层与上游子模块的契约。
 
-    `sso/` 是一层薄适配（见 `sso/__init__.py`）：本地只留 client/config/runner/
-    ui/utils/aiagent，其余（qr/registry/rsa_key/system_api）**别名**到子模块。
-    这里把「哪些归本地、哪些归上游、上游该有哪些方法」定成断言 ——
-    上游一旦改签名或挪文件，离线自检就会先挂，而不是等到登录时才炸。
+    `sso/` 是薄适配：本地只留 client/config/runner/ui/utils，其余（qr/registry/
+    rsa_key/system_api）别名到子模块。这里把「哪些归本地、上游该有哪些方法」定成
+    断言，上游改签名或挪文件时离线自检先挂。
     """
     print("\n[12] sso 本地层 ← 子模块契约")
     vendor = Path(sso.VENDOR_DIR)
@@ -719,7 +704,7 @@ def test_sso_submodule() -> None:
         check(f"sso.{name} 已登记在 sys.modules",
               sys.modules.get(f"sso.{name}") is mod)
 
-    for name in ("client", "config", "runner", "ui", "utils", "aiagent"):
+    for name in ("client", "config", "runner", "ui", "utils"):
         mod = __import__(f"sso.{name}", fromlist=[name])
         path = Path(getattr(mod, "__file__", ""))
         check(f"sso.{name} 是本地实现",

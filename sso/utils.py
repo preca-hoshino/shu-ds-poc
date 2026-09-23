@@ -1,9 +1,7 @@
 """工具函数：RSA 加密、参数编码、脱敏、日志。
 
-本地实现，与子模块 `src/utils.py` 的两点差别：
-- `redact()` 抹得更全（令牌 / Cookie / 会话 Cookie 名，见 `_SECRET_KEYS`）；
-- 多了 `write_private_json()`（凭据不脱敏、0600）与 `mask_cookie_header()`（日志用）。
-RSA 公钥抓取仍走子模块的 `sso.rsa_key`（= `src.rsa_key`）。
+与子模块 `src/utils.py` 的差别：`redact()` 抹得更全（含令牌 / Cookie 名），
+另有 `write_private_json()`（凭据不脱敏、0600）与 `mask_cookie_header()`。
 """
 
 from __future__ import annotations
@@ -29,7 +27,6 @@ def rsa_encrypt_password(plain: str) -> str:
 def b64_params(oauth_params: dict) -> str:
     """把 OAuth 参数编码成上游前端使用的 **base64url（去掉 = 填充）**。
 
-    例：`eyJyZXNwb25zZVR5cGUiOiJjb2RlIiwi...`（含 `_` 不含 `/`，无 padding）。
     注意与 WebVPN 的 state 不同 —— 那个是标准 base64（带填充）。
     """
     raw = json.dumps(oauth_params, separators=(",", ":"), ensure_ascii=False)
@@ -51,11 +48,10 @@ _SECRET_KEYS = {
 
 
 def redact(obj):
-    """递归剔除敏感字段，避免密码/授权码/令牌写入证据文件。
+    """递归剔除敏感字段，避免密码 / 授权码 / 令牌写入证据文件。
 
     URL 查询串里的 `?code=xxx` 也要处理，否则 location / authorize_url
-    这类字段会把一次性授权码原样写进证据文件。
-    凭据本身不经过这里 —— 它用 `write_private_json()` 完整落盘（0600）。
+    这类字段会把一次性授权码原样写进证据文件。凭据不走这里（用 `write_private_json`）。
     """
     if isinstance(obj, dict):
         return {k: ("***REDACTED***" if k.lower() in _SECRET_KEYS else redact(v))
@@ -78,8 +74,8 @@ def save_json(name: str, payload) -> Path:
 def write_private_json(path: Path, payload) -> Path:
     """把**不脱敏**的 payload 写成仅当前用户可读的文件（用于凭据）。
 
-    与 `save_json`（脱敏、进 captures/）分开：凭据必须完整保存，
-    但权限要收紧到 0600（POSIX；Windows 上 chmod 退化为只读位，可接受）。
+    与 `save_json`（脱敏、进 captures/）分开：凭据必须完整保存，权限收紧到 0600
+    （POSIX；Windows 上 chmod 退化为只读位，可接受）。
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

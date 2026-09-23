@@ -1,9 +1,4 @@
-"""凭据文件（`.credentials.json`）的读写与取值。
-
-凭据来自 `login.py` 的结构化产物，每一项都可用环境变量覆盖。
-
-取值优先级：环境变量 > 凭据文件 > 内置默认值。
-"""
+"""凭据文件（`.credentials.json`）的读写与取值：环境变量 > 文件 > 默认值。"""
 
 from __future__ import annotations
 

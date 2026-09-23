@@ -1,10 +1,7 @@
-"""上游（FastGPT）侧的数据模型与解析。
+"""上游（FastGPT）侧的数据模型、解析与「响应 → OpenAI 字典」转换。
 
-上游请求体用 camelCase（`dataId` / `hideInUI` / `cTime` …），这里用
-`alias_generator=to_camel` 生成别名，序列化时 `by_alias=True` 对上。
-
-本模块同时负责「上游响应 → OpenAI 响应字典」的转换，输出的字典**字段与
-OpenAI 规范完全一致**（多一个不多）。
+请求体走 camelCase：`alias_generator=to_camel` + 序列化 `by_alias=True`。
+输出字典字段与 OpenAI 规范完全一致。
 """
 
 from __future__ import annotations
@@ -105,9 +102,8 @@ def make_variables(user_id: str = "", access_token: str = "", privatekey: str = 
 class FastGptResponseMessage(BaseModel):
     """上游响应里的消息体。
 
-    `content` 可能是分段数组，也可能是纯字符串（2026-09-23 实测就是字符串），
-    两种都要能解析；推理链可能藏在分段里（`type: "reasoning"`），也可能
-    单独放在 `reasoning_content`（FastGPT 自己的字段名，与 DeepSeek 一致）。
+    `content` 可能是分段数组也可能是字符串，推理链可能在分段里（`type: "reasoning"`）
+    或在 `reasoning_content` 字段上，两种形态都要能解析。
     """
 
     model_config = ConfigDict(extra="allow")
@@ -167,9 +163,8 @@ def content_reasoning(content: str | list[dict[str, Any]]) -> str:
 def parse_content(resp: FastGptResponse) -> tuple[str, str]:
     """拆出 (正文, 推理链)。
 
-    上游 `content` 为分段数组时按段类型归位：`text` → 正文、`reasoning` → 推理链；
-    为纯字符串时整段算正文。推理链还可能在消息的 `reasoning_content` 字段上
-    （FastGPT 较新版本给的形态）——分段里已经有推理时以分段为准，避免重复。
+    `content` 为分段数组时按类型归位（`text` / `reasoning`），为字符串时整段算正文；
+    推理也可能在 `reasoning_content` 字段上，分段里已有则以分段为准。
     """
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
@@ -199,10 +194,9 @@ def estimate_tokens(chars: int) -> int:
 
 def split_reasoning_tokens(completion_tokens: int, reasoning_chars: int,
                            content_chars: int) -> int:
-    """按字符占比从 `completion_tokens` 里拆出 `reasoning_tokens`。
+    """按字符占比从 `completion_tokens` 拆出 `reasoning_tokens`。
 
-    DeepSeek 的 `completion_tokens` 含推理 token，所以推理部分不能凭空估算 ——
-    有真实总数时按正文/推理的字符比切分，总数才自洽（估算值可能比总数还大）。
+    该总数已含推理 token，只能按字符比切分，否则会算出比总数还大的值。
     """
     total_chars = reasoning_chars + content_chars
     if completion_tokens <= 0 or reasoning_chars <= 0 or total_chars <= 0:
@@ -211,12 +205,10 @@ def split_reasoning_tokens(completion_tokens: int, reasoning_chars: int,
 
 
 def _upstream_usage_usable(usage: dict[str, Any] | None) -> bool:
-    """上游非流式 usage 是否可信。
+    """上游 usage 是否可信。
 
-    2026-09-23 实测：上游固定返回占位值
-    `{"prompt_tokens":1,"completion_tokens":1,"total_tokens":1}`，与真实用量无关。
-    此时改用字符数估算，避免对外给出明显错误的数字。
-    任一字段大于 1 即认为上游给出了真实值。
+    实测非流式固定返回占位值 `1/1/1`（与真实用量无关），此时改用字符估算。
+    任一字段 > 1 即认为给了真实值。
     """
     if not usage:
         return False
@@ -225,11 +217,7 @@ def _upstream_usage_usable(usage: dict[str, Any] | None) -> bool:
 
 
 def usage_from_upstream(resp: FastGptResponse) -> bool:
-    """上游是否给了可信的真实 usage。
-
-    `False` 表示 `to_openai_response()` 对外给的是**字符估算值**，
-    控制台遥测（`proxy/telemetry.py`）据此标注统计块。
-    """
+    """上游是否给了可信 usage（`False` = 对外是字符估算值，供遥测标注）。"""
     return _upstream_usage_usable(resp.usage)
 
 
@@ -254,16 +242,7 @@ def to_openai_response(resp: FastGptResponse, model: str, created: int,
                        prompt_chars: int) -> dict[str, Any]:
     """把上游响应转成 OpenAI 兼容响应字典。
 
-    参数
-    ----
-    resp
-        已解析的上游响应。
-    model
-        **返回给客户端的模型名**（回显请求里的那个，与规范一致）。
-    created
-        Unix 时间戳。
-    prompt_chars
-        请求消息的总字符数（上游不给可信 usage 时用于估算）。
+    `model` 是回显给客户端的名字（请求里那个）；`prompt_chars` 供估算 usage。
     """
     text, reasoning = parse_content(resp)
 

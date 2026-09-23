@@ -2,18 +2,10 @@
 # -*- coding: utf-8 -*-
 """端到端自检（不联网）：用本地 mock 上游验证 HTTP 层的规范一致性。
 
-覆盖：
-    1. 鉴权（401 的形状与 code）
-    2. 端点面：只有 /v1/chat/completions 与 /v1/models，其余一律 404
-    3. 非流式响应字段（含 choice / usage 结构）
-    4. 流式帧序列（首帧 role、收尾 finish_reason、usage 帧、[DONE]）
-    5. 模型校验（未知模型 → 404 model_not_found）
-    6. 请求体错误（非 JSON / 缺字段 → 400）
-    7. 上游错误透传（状态码沿用 + OpenAI 错误体）
-    8. 上游收到的请求体确实是上游格式
+覆盖：鉴权 401、端点面（其余 404）、非流式字段、流式帧序列、模型校验、
+请求体 400、上游错误透传、上游收到的请求体确实是上游格式。
 
-用法:
-    .venv\\Scripts\\python.exe tests\\test_e2e_mock.py
+用法: .venv\\Scripts\\python.exe tests\\test_e2e_mock.py
 """
 
 from __future__ import annotations

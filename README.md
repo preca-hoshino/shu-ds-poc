@@ -23,32 +23,31 @@ flowchart TD
     D --> E
     E --> F["GET /oauth/authorize<br/>取授权码"]
     F --> G["GET /dsssologin/getSsoUser<br/>看 isSussess 字段"]
-    G --> H["引导对话后端会话<br/>收下它自己下发的 Cookie"]
-    H --> I[".credentials.json"]
+    G --> H[".credentials.json"]
 
-    I --> J["poc.py·起服务"]
-    J --> K["POST /v1/chat/completions"]
-    K --> L["OpenAI → 上游转换"]
-    L --> M["千学百科对话后端<br/>aiagent.shu.edu.cn"]
-    M -->|SSE| N["上游 → OpenAI<br/>正文 / 推理链 / usage"]
-    N --> K
+    H --> I["poc.py·起服务"]
+    I --> J["POST /v1/chat/completions"]
+    J --> K["OpenAI → 上游转换"]
+    K --> L["千学百科对话后端<br/>aiagent.shu.edu.cn"]
+    L -->|SSE| M["上游 → OpenAI<br/>正文 / 推理链 / usage"]
+    M --> J
 ```
 
-整体流程：**认证 → 换 ds 会话 → 引导对话后端会话 → 产出凭据 → 起服务**。
-其中 ① ② ③ ④ 均在 `login.py` 内完成、全程只需一次，之后 `poc.py` 用凭据长期提供服务。
+整体流程：**认证 → 换 ds 会话 → 产出凭据 → 起服务**。
+其中 ① ② ③ 均在 `login.py` 内完成、全程只需一次，之后 `poc.py` 用凭据长期提供服务。
 
 千学百科的 Web 端在 `ds.shu.edu.cn`，是纯前端 SPA（对任何路径都返回同一份 `index.html`），
 身份与令牌由该站**后端**接口下发；对话请求由 `aiagent.shu.edu.cn` 上的分享链承接。
-`login.py` 走完整条链路取回凭据，`poc.py` 只用其中的 Cookie 与分享链访问对话接口。
+`login.py` 走完整条链路取回凭据，`poc.py` 只用其中的分享链与 ds 用户信息访问对话接口。
 
 | 文件 | 职责 |
 | :--- | :--- |
-| `login.py` | 认证 → 换 ds 会话 → 引导对话后端会话 → 写出 `.credentials.json` |
+| `login.py` | 认证 → 换 ds 会话 → 写出 `.credentials.json` |
 | `poc.py` | 读凭据 → 起 OpenAI 兼容服务（默认 `127.0.0.1:3000`） |
 | `sso/` | 登录环节的薄适配层；统一身份认证实现在 git 子模块 [`vendor/shu-sso-poc/`](vendor/shu-sso-poc/) |
 | `proxy/` | OpenAI ↔ 上游转换与 HTTP 服务 |
 
-> `sso/` 只保留本项目改动过的文件（`client` 子类、`config`、`runner`、`ui`、`utils`、`aiagent`）；
+> `sso/` 只保留本项目改动过的文件（`client` 子类、`config`、`runner`、`ui`、`utils`）；
 > `qr`、`registry`、`rsa_key`、`system_api` 通过 `sys.modules` 别名直接复用子模块，只有一份实现，
 > 因此上游更新不会与本地改动冲突。详见 [`sso/__init__.py`](sso/__init__.py)。
 
@@ -94,24 +93,7 @@ ds 的 Web 端是纯前端 SPA，换会话由它的**后端**接口完成 ——
 - **ds 的会话不在 Cookie 里** —— 返回的 `userid` 才是关键；`datas` 中一并带出学号、姓名
   与 `accessToken` / `privatekey`（原样带进上游请求的 `variables`）。
 
-### ③ 引导对话后端会话
-
-对话后端 `aiagent.shu.edu.cn` 使用它自己下发的 Cookie（`uname` / `fid` / `xxtenc` /
-`_webvpn_key` …），与认证侧的 Cookie 不是同一套。`sso/aiagent.py` 的做法是：
-
-1. 把认证会话里 `*.shu.edu.cn` 的 Cookie 以**空 domain** 塞进临时会话 ——
-   `RequestsCookieJar.update()` 生成 `domain=""`，`http.cookiejar` 对空 domain 的判定是
-   「匹配任意主机」，等价于手工写 `Cookie:` 头；
-2. `GET https://aiagent.shu.edu.cn/`，记录整条跳转链与新增 Cookie；
-3. 若被重定向到认证站点，就从 URL 里解出 `client_id` / `redirect_uri`
-   （支持 `/oauth2/login/<base64url>` 与标准查询串两种形态），用已有认证会话补一次
-   `authorize`，再跟随回调换会话。
-
-```bash
-python login.py --cookie "uname=...; _webvpn_key=...; ..."
-```
-
-### ④ 产出：凭据文件
+### ③ 产出：凭据文件
 
 `.credentials.json`（权限 `0600`，已在 `.gitignore`）：
 
@@ -124,25 +106,29 @@ python login.py --cookie "uname=...; _webvpn_key=...; ..."
   "upstream": { "base": "https://aiagent.shu.edu.cn",
                 "chat_path": "/api/v2/chat/completions" },
   "share_id": "49imnzpquhvt2gnj8xqxmcch",
-  "cookie_header": "uname=25123368; _webvpn_key=...; ...",  // 上游请求直接用这串
+  "cookie_header": "SHU_OAUTH2=...",                       // 上游请求直接用这串
   "cookies": { "...": "..." },
-  "sso_cookies": { "...": "..." },                          // 认证环节建立的会话
   "ds": { "userid": "25123368", "name": "同学",
-          "access_token": "...", "private_key": "...", "raw": {} },
-  "aiagent": { "ok": true, "seeded": ["..."], "hint": null }
+          "access_token": "...", "private_key": "...", "raw": {} }
 }
 ```
 
 `cookie_header` 是发给对话接口的那一串；`ds` 段是换会话时 ds 后端返回的用户信息，
 其中 `userid` 用作上游 `variables.userId`，`access_token` / `private_key` 一并带上。
 
+实测约束：**上游对话接口不校验 Cookie** —— 用真实 Cookie、编造 Cookie
+（`uname=x; _webvpn_key=demo`）、完全不带 Cookie 发同一请求，三种都返回 HTTP 200。
+真正起作用的是公开分享链（`shareId`）与请求形状（`Referer` / `variables`），
+因此登录侧拿到分享链与 ds 用户信息即可，不必再去引导上游会话。
+要确认手上这份凭据还能用，直接 `python login.py --check`（真发一次最小请求）。
+
 ### 关键结论
 
-1. **一次登录、长期复用** —— ① ② ③ 只在 `login.py` 里跑一次，产出的 Cookie 供 `poc.py` 长期使用；
-   Cookie 由站点会话决定，失效后上游会报错（状态码原样透传），重新 `python login.py` 即可；
-2. **各环节互不影响** —— ds 换会话失败不影响认证会话本身；引导失败可用 `--cookie` 手工兜底；
-   上游对话接口报错只影响当次请求，`login.py` 仍会写出凭据以便排查
-   （分别见 `sso/runner.py` 的 `login_all_systems()`、`sso/aiagent.py` 的 `bootstrap_aiagent()`）；
+1. **一次登录、长期复用** —— ① ② ③ 只在 `login.py` 里跑一次，产出的凭据供 `poc.py` 长期使用；
+   失效后上游会报错（状态码原样透传），重新 `python login.py` 即可；
+2. **各环节互不影响** —— ds 换会话失败不影响认证会话本身，`login.py` 仍会写出凭据以便排查；
+   上游对话接口报错只影响当次请求（分别见 `sso/runner.py` 的 `login_all_systems()`
+   与 [`proxy/upstream.py`](proxy/upstream.py) 的 `UpstreamError`）；
 3. **API 面严格等于 OpenAI 规范** —— 只暴露两个端点，字段、错误体、SSE 帧序列一律照规范，
    不出现任何自造字段（[`tests/test_offline.py`](tests/test_offline.py) 有
    `set(resp) == RESPONSE_KEYS` 一类断言兜着）；
@@ -322,7 +308,7 @@ data: [DONE]
 | 上游报错 | **沿用上游状态码** | `api_error` | `null` | `null` |
 | 其它异常 | 500 | `server_error` | `null` | `null` |
 
-上游原文会带在 `message` 里，方便直接读出「Cookie 过期 / shareId 无效」这类原因。
+上游原文会带在 `message` 里，方便直接读出「分享链失效 / 参数不对」这类原因。
 
 ---
 
@@ -404,9 +390,8 @@ python docs/scripts/probe_upstream_raw.py --matrix                   # 两条链
 | `--qr-style {block,ascii}` | `block` | 二维码渲染样式 |
 | `--out` | `.credentials.json` | 凭据输出路径 |
 | `--base` | `https://aiagent.shu.edu.cn` | 上游站点根地址 |
-| `--no-bootstrap` | 关闭 | 跳过引导（只拿认证侧 Cookie） |
 | `--cookie "<串>"` | 无 | 手工粘贴 Cookie（跳过认证环节的兜底路径） |
-| `--check` | 关闭 | 用已有凭据复探上游，不重新登录 |
+| `--check` | 关闭 | 用已有凭据真发一次最小请求，确认还能用（不重新登录） |
 
 ### poc.py
 
@@ -463,7 +448,7 @@ python docs/scripts/probe_toolcall.py                               # 接口面 
 
 | 约束 | 说明 |
 | :--- | :--- |
-| 凭据会过期 | Cookie 由站点会话决定；失效后上游报错、状态码原样透传，重新 `python login.py` 即可 |
+| 凭据会失效 | 取决于分享链是否还在（Cookie 上游不校验）；失效后上游报错、状态码原样透传，`login.py --check` 可确诊，重新 `python login.py` 即可 |
 | 只有一个 choice | 上游只返回单条回复，`n > 1` 接受但无效 |
 | 不做多轮会话记录 | 上游 `chatId` 恒为空串，每次请求相互独立 |
 | 部分规范参数无效 | `temperature` / `max_tokens` 等上游接口不接受，发了也不起作用（见「请求字段」） |
