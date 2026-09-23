@@ -17,6 +17,7 @@ from . import credentials as creds_mod
 from . import fastgpt as fg
 from . import schemas as sc
 from . import stream as st
+from . import telemetry as tm
 from . import transform as tf
 from .upstream import Upstream, UpstreamError
 
@@ -64,20 +65,35 @@ async def acompletion(upstream: Upstream, req: sc.ChatCompletionRequest) -> dict
     model = _canonical_model(req)
     _log_ignored(req)
 
+    prompt_chars = sc.count_chars(req.messages)
+    rl = tm.RequestLog(req.model, stream=False, messages=len(req.messages),
+                       prompt_chars=prompt_chars)
+    rl.input_line()
+
     payload = tf.build_fastgpt_request(req, creds_view(upstream.creds), model)
-    resp = await upstream.chat(payload)
     try:
-        raw = (await resp.aread()).decode("utf-8", "replace")
-    finally:
-        await resp.aclose()          # 上游响应是流式拿到的，读完必须显式释放
+        resp = await upstream.chat(payload)
+        rl.mark_ttfb()
+        try:
+            raw = (await resp.aread()).decode("utf-8", "replace")
+        finally:
+            await resp.aclose()      # 上游响应是流式拿到的，读完必须显式释放
 
-    try:
-        parsed = fg.FastGptResponse.model_validate_json(raw)
-    except ValidationError as exc:
-        raise UpstreamError(f"上游响应不是预期的 JSON 结构：{exc}", 502, raw[:2000]) from exc
+        try:
+            parsed = fg.FastGptResponse.model_validate_json(raw)
+        except ValidationError as exc:
+            raise UpstreamError(f"上游响应不是预期的 JSON 结构：{exc}", 502, raw[:2000]) from exc
 
-    return fg.to_openai_response(parsed, req.model, int(time.time()),
-                                 prompt_chars=sc.count_chars(req.messages))
+        out = fg.to_openai_response(parsed, req.model, int(time.time()),
+                                    prompt_chars=prompt_chars)
+    except Exception as exc:                        # noqa: BLE001
+        rl.fail(type(exc).__name__)
+        raise
+
+    usage = out["usage"]
+    rl.finish(int(usage["prompt_tokens"]), int(usage["completion_tokens"]),
+              estimated=not fg.usage_from_upstream(parsed))
+    return out
 
 
 async def _closing_bytes(resp: httpx.Response) -> AsyncIterator[bytes]:
@@ -101,6 +117,16 @@ async def astream(upstream: Upstream, req: sc.ChatCompletionRequest) -> AsyncIte
     model = _canonical_model(req)
     _log_ignored(req)
 
+    prompt_chars = sc.count_chars(req.messages)
+    rl = tm.RequestLog(req.model, stream=True, messages=len(req.messages),
+                       prompt_chars=prompt_chars)
+    rl.input_line()
+
     payload = tf.build_fastgpt_request(req, creds_view(upstream.creds), model)
-    resp = await upstream.chat(payload)
-    return st.translate_stream(_closing_bytes(resp), req, model=req.model)
+    try:
+        resp = await upstream.chat(payload)
+    except Exception as exc:                        # noqa: BLE001
+        rl.fail(type(exc).__name__)
+        raise
+    rl.mark_ttfb()
+    return st.translate_stream(_closing_bytes(resp), req, model=req.model, telemetry=rl)

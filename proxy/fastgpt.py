@@ -224,6 +224,15 @@ def _upstream_usage_usable(usage: dict[str, Any] | None) -> bool:
                for k in ("prompt_tokens", "completion_tokens", "total_tokens"))
 
 
+def usage_from_upstream(resp: FastGptResponse) -> bool:
+    """上游是否给了可信的真实 usage。
+
+    `False` 表示 `to_openai_response()` 对外给的是**字符估算值**，
+    控制台遥测（`proxy/telemetry.py`）据此标注统计块。
+    """
+    return _upstream_usage_usable(resp.usage)
+
+
 def build_usage(prompt_tokens: int, completion_tokens: int,
                 reasoning_tokens: int = 0) -> dict[str, Any]:
     """构造规范里的 `usage` 结构。"""

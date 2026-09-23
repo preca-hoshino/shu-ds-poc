@@ -33,6 +33,7 @@ from typing import Any, AsyncIterator
 
 from . import fastgpt as fg
 from . import schemas as sc
+from . import telemetry as tm
 
 #: SSE 帧分隔符（上游两种都可能出现）
 _SEPARATORS = (b"\n\n", b"\r\n\r\n")
@@ -228,7 +229,8 @@ def _handle_frame(frame: bytes, stats: _Stats, model: str,
 
 async def translate_stream(byte_iter: AsyncIterator[bytes],
                            req: sc.ChatCompletionRequest,
-                           model: str) -> AsyncIterator[str]:
+                           model: str,
+                           telemetry: tm.RequestLog | None = None) -> AsyncIterator[str]:
     """把上游字节流翻译成 OpenAI SSE 文本流。
 
     参数
@@ -239,6 +241,8 @@ async def translate_stream(byte_iter: AsyncIterator[bytes],
         原始请求（取 `stream_options.include_usage` 与用于估算的 prompt 字符数）。
     model
         返回给客户端的模型名（回显请求里的那个）。
+    telemetry
+        控制台遥测（可空）。给了就在首个内容分片下发时打点、流结束时打统计。
     """
     created = int(time.time())
     prompt_chars = sc.count_chars(req.messages)
@@ -246,39 +250,60 @@ async def translate_stream(byte_iter: AsyncIterator[bytes],
     stats = _Stats()
     splitter = FrameSplitter()
 
-    # 首帧：OpenAI 固定先发一个只有 role 的 delta
-    yield _chunk(model, created, {"role": "assistant", "content": ""})
+    def tokens() -> tuple[int, int, bool]:
+        """(输入, 输出, 是否为字符估算)。上游 chatNode 统计优先。"""
+        estimated = stats.actual_prompt is None or stats.actual_completion is None
+        return (
+            stats.actual_prompt if stats.actual_prompt is not None
+            else fg.estimate_tokens(prompt_chars),
+            stats.actual_completion if stats.actual_completion is not None
+            else fg.estimate_tokens(stats.completion_chars),
+            estimated,
+        )
 
-    async for raw in byte_iter:
-        for frame in splitter.feed(raw):
-            for piece in _handle_frame(frame, stats, model, created):
+    def note() -> None:
+        """标记首个内容分片已下发（遥测用，重复调用只生效一次）。"""
+        if telemetry is not None:
+            telemetry.mark_first_token()
+
+    try:
+        # 首帧：OpenAI 固定先发一个只有 role 的 delta
+        yield _chunk(model, created, {"role": "assistant", "content": ""})
+
+        async for raw in byte_iter:
+            for frame in splitter.feed(raw):
+                for piece in _handle_frame(frame, stats, model, created):
+                    note()
+                    yield piece
+
+        tail = splitter.flush()
+        if tail.strip():
+            for piece in _handle_frame(tail, stats, model, created):
+                note()
                 yield piece
 
-    tail = splitter.flush()
-    if tail.strip():
-        for piece in _handle_frame(tail, stats, model, created):
-            yield piece
+        # 上游没在增量里给推理链、只在收尾统计里给了 reasoningText → 补一帧再收尾
+        if stats.reasoning_fallback and not stats.reasoning_chars:
+            stats.reasoning_chars = len(stats.reasoning_fallback)
+            stats.completion_chars += stats.reasoning_chars
+            yield _chunk(model, created, {"reasoning_content": stats.reasoning_fallback})
 
-    # 上游没在增量里给推理链、只在收尾统计里给了 reasoningText → 补一帧再收尾
-    if stats.reasoning_fallback and not stats.reasoning_chars:
-        stats.reasoning_chars = len(stats.reasoning_fallback)
-        stats.completion_chars += stats.reasoning_chars
-        yield _chunk(model, created, {"reasoning_content": stats.reasoning_fallback})
+        # 收尾帧：finish_reason
+        yield _chunk(model, created, {}, finish_reason=stats.finish_reason)
 
-    # 收尾帧：finish_reason
-    yield _chunk(model, created, {}, finish_reason=stats.finish_reason)
+        if req.include_usage:
+            prompt_tokens, completion_tokens, _ = tokens()
+            yield _usage_frame(model, created, fg.build_usage(
+                prompt_tokens, completion_tokens,
+                fg.split_reasoning_tokens(completion_tokens, stats.reasoning_chars,
+                                          stats.completion_chars - stats.reasoning_chars)))
 
-    if req.include_usage:
-        prompt_tokens = (stats.actual_prompt if stats.actual_prompt is not None
-                         else fg.estimate_tokens(prompt_chars))
-        completion_tokens = (stats.actual_completion if stats.actual_completion is not None
-                             else fg.estimate_tokens(stats.completion_chars))
-        yield _usage_frame(model, created, fg.build_usage(
-            prompt_tokens, completion_tokens,
-            fg.split_reasoning_tokens(completion_tokens, stats.reasoning_chars,
-                                      stats.completion_chars - stats.reasoning_chars)))
-
-    yield DONE
+        yield DONE
+    finally:
+        # 客户端中途断开时生成器被关闭，这里同样会执行 → 统计照打，不留半截日志
+        if telemetry is not None:
+            prompt_tokens, completion_tokens, estimated = tokens()
+            telemetry.finish(prompt_tokens, completion_tokens, estimated=estimated)
 
 
 def iter_stream_text(text: str) -> AsyncIterator[bytes]:

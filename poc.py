@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 
@@ -31,6 +32,23 @@ DEFAULT_API_KEY = "sk-shu-secret-key-12345"
 def env_api_key() -> str:
     """API Key 取值：环境变量 > 默认。"""
     return os.getenv("PROXY_API_KEY") or DEFAULT_API_KEY
+
+
+def setup_logging(level: str) -> None:
+    """把本项目的 logger 接到 stdout。
+
+    uvicorn 的日志配置只管它自己的 logger，项目的 `shu-ds-poc` logger 不接一下
+    就落在没有 handler 的 root 上 —— INFO 级别的请求遥测会直接丢掉。
+    """
+    numeric = getattr(logging, level.upper(), None)
+    if not isinstance(numeric, int):
+        numeric = logging.DEBUG          # uvicorn 的 "trace"
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger("shu-ds-poc")
+    logger.handlers[:] = [handler]
+    logger.setLevel(numeric)
+    logger.propagate = False
 
 
 def banner(args, creds: dict) -> None:
@@ -50,6 +68,7 @@ def banner(args, creds: dict) -> None:
     print(f" API Key  : {args.api_key}")
     print(" 端点     : POST /v1/chat/completions")
     print("           GET  /v1/models")
+    print(" 遥测     : 每个请求打印输入状态与输出统计（tokens / TPS / 耗时）")
     print("=" * 62)
 
     age = creds_mod.age_hours(creds)
@@ -103,6 +122,7 @@ def main() -> int:
 
     app = server_mod.make_app(creds, api_key=args.api_key, base=args.base,
                               timeout=args.timeout, verify=not args.insecure)
+    setup_logging(args.log_level)
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level,
                 access_log=args.access_log)
     return 0

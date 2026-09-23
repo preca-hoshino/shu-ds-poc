@@ -14,6 +14,7 @@
     9. 流式推理链（增量 reasoning_content / 收尾 reasoningText 兜底 / finishReason 映射）
    10. 上游连接必须真流式（不是 httpx 便捷方法那种预读整段正文）
    12. sso 本地层与上游子模块的接口契约（`sso.*` ← `vendor/shu-sso-poc/src/*`）
+   13. 控制台遥测（一行输入状态 + 一块输出统计）
 
 用法:
     .venv\\Scripts\\python.exe tests\\test_offline.py
@@ -23,9 +24,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import httpx
@@ -38,6 +42,7 @@ from proxy import credentials as creds_mod               # noqa: E402
 from proxy import fastgpt as fg                          # noqa: E402
 from proxy import schemas as sc                          # noqa: E402
 from proxy import stream as st                           # noqa: E402
+from proxy import telemetry as tm                        # noqa: E402
 from proxy import transform as tf                        # noqa: E402
 from proxy import upstream as up_mod                     # noqa: E402
 import sso                                               # noqa: E402
@@ -579,6 +584,121 @@ async def _collect(raw: bytes, include_usage: bool) -> list[str]:
                                                 req, model=req.model)]
 
 
+class _Capture(logging.Handler):
+    """把遥测日志收进列表（离线自检用）。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lines: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.lines.append(record.getMessage())
+
+
+async def _collect_with_telemetry(raw: bytes) -> list[str]:
+    """带遥测的流式收集（`telemetry` 由 `translate_stream` 自己收尾）。"""
+    req = sc.ChatCompletionRequest.model_validate({
+        "model": "deepseek-v3",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": True,
+    })
+    rl = tm.RequestLog(req.model, stream=True, messages=len(req.messages),
+                       prompt_chars=sc.count_chars(req.messages))
+    rl.input_line()
+    return [x async for x in st.translate_stream(st.iter_stream_text(raw.decode()),
+                                                req, model=req.model, telemetry=rl)]
+
+
+def test_telemetry() -> None:
+    """[13] 控制台遥测：请求进来一行输入状态，输出完毕一块统计。
+
+    只校验**日志文本**（遥测不进响应体）—— 客户端拿到的仍是规范结构，
+    这条由 [5]/[9] 的字段断言卡着。
+    """
+    print("\n[13] 控制台遥测（输入状态 / 输出统计）")
+
+    check("_tps 正常算数值", tm._tps(652, 10.0) == "65.2 tok/s", tm._tps(652, 10.0))
+    check("生成窗口过短不报 TPS", tm._tps(652, 0.01) == "—", tm._tps(652, 0.01))
+    check("没有 token 不报 TPS", tm._tps(0, 10.0) == "—", tm._tps(0, 10.0))
+
+    logger = logging.getLogger("shu-ds-poc")
+    saved = (logger.level, logger.propagate)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False                 # 免得 WARNING 落到 lastResort 去刷 stderr
+    cap = _Capture()
+    logger.addHandler(cap)
+    try:
+        # 1) 非流式：一行输入 + 一块统计
+        rl = tm.RequestLog("deepseek-v3", stream=False, messages=3, prompt_chars=412)
+        rl.input_line()
+        rl.mark_ttfb()
+        rl.finish(224, 652)
+        rl.finish(1, 1)                      # 重复收尾不再打
+        rl.fail("UpstreamError")             # 已收尾 → 也不打失败行
+
+        check("输入行：模型 / 流式 / 消息数 / prompt 字符数",
+              cap.lines[0] == "→ deepseek-v3  stream=false  消息=3  prompt=412 字符",
+              cap.lines[0])
+        block = cap.lines[1]
+        for label in ("输入", "输出", "模型生成 TPS", "首 Token 耗时",
+                      "端到端吞吐", "端到端耗时"):
+            check(f"统计块含「{label}」", label in block, block)
+        check("统计块用调用方传入的 tokens",
+              "  输入          224 tokens" in block
+              and "  输出          652 tokens" in block, block)
+        check("非流式不报模型生成 TPS",
+              re.search(r"模型生成 TPS  —", block) is not None, block)
+        check("重复 finish / 收尾后 fail 都不再打", len(cap.lines) == 2, str(cap.lines))
+
+        # 2) 失败路径有收尾行，不留半截日志
+        cap.lines.clear()
+        rl3 = tm.RequestLog("m", stream=False, messages=1, prompt_chars=1)
+        rl3.input_line()
+        rl3.fail("UpstreamError")
+        check("失败路径有收尾行",
+              cap.lines[1].startswith("← 失败 UpstreamError"), cap.lines[1])
+
+        # 3) 流式：首个分片打点后生成窗口可量 → 报数值 TPS
+        cap.lines.clear()
+        rl2 = tm.RequestLog("deepseek-r1", stream=True, messages=1, prompt_chars=10)
+        rl2.input_line()
+        rl2.mark_ttfb()
+        rl2.mark_first_token()
+        time.sleep(0.06)
+        rl2.finish(100, 200)
+        check("流式报出数值 TPS",
+              re.search(r"模型生成 TPS  \d+\.\d tok/s", cap.lines[1]) is not None,
+              cap.lines[1])
+
+        # 4) 上游 chatNode 的真实 token 数走到统计块
+        cap.lines.clear()
+        raw = (f"event: answer\ndata: {json.dumps({'choices': [{'delta': {'content': '你好'}}]})}\n\n"
+               f"event: flowNodeResponse\ndata: {json.dumps({'moduleType': 'chatNode', 'inputTokens': 224, 'outputTokens': 652})}\n\n"
+               "event: answer\ndata: [DONE]\n\n").encode()
+        asyncio.run(_collect_with_telemetry(raw))
+        block = cap.lines[1]
+        check("流式统计用上游 chatNode 的真实 tokens",
+              "  输入          224 tokens" in block
+              and "  输出          652 tokens" in block, block)
+        check("真实值时不标注估算", "字符估算" not in block, block)
+        check("流式有首 Token 耗时数值",
+              re.search(r"首 Token 耗时 \d+\.\d+ s", block) is not None, block)
+
+        # 5) 上游不给统计 → 按字符估算，块头要标注
+        cap.lines.clear()
+        raw2 = (f"event: answer\ndata: {json.dumps({'choices': [{'delta': {'content': '你好'}}]})}\n\n"
+                "event: answer\ndata: [DONE]\n\n").encode()
+        asyncio.run(_collect_with_telemetry(raw2))
+        block = cap.lines[1]
+        check("上游不给统计时块头标注字符估算", "字符估算" in block, block)
+        check("估算的输入 = prompt 字符数 × 2/3",
+              f"  输入          {fg.estimate_tokens(2)} tokens" in block, block)
+    finally:
+        logger.removeHandler(cap)
+        logger.setLevel(saved[0])
+        logger.propagate = saved[1]
+
+
 def test_sso_submodule() -> None:
     """[12] 本地层与上游子模块的契约。
 
@@ -666,6 +786,7 @@ def main() -> int:
     test_stream_frames()
     test_stream_reasoning()
     test_upstream_streaming()
+    test_telemetry()
     test_sso_submodule()
 
     print()
