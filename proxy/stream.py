@@ -8,6 +8,9 @@ token 数、`reasoningText`、`finishReason`）、`flowNodeStatus`（忽略）�
 
 推理链走 `reasoning_content`：上游给增量就原样转出；只在收尾统计里给了
 `reasoningText` 时，在 `finish_reason` 帧之前补一帧。
+
+请求带 `tools` 时正文额外过一遍提示词协议过滤器（`toolcall.ReplyFilter`）：`0:` 前缀
+剥掉后照常流出，`1:` 则整段缓冲成 `tool_calls` 帧。
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from typing import Any, AsyncIterator
 from . import fastgpt as fg
 from . import schemas as sc
 from . import telemetry as tm
+from . import toolcall as tc
 
 #: SSE 帧分隔符（上游两种都可能出现）
 _SEPARATORS = (b"\n\n", b"\r\n\r\n")
@@ -123,6 +127,8 @@ class _Stats:
         self.reasoning_fallback = ""
         #: 上游的完成原因（`stop` / `length`）
         self.upstream_finish: str | None = None
+        #: 提示词模式解析出的工具调用（非空时 `finish_reason` 用 `tool_calls`）
+        self.tool_calls: list[dict[str, Any]] | None = None
 
     def absorb_flow_node(self, val: dict[str, Any]) -> None:
         """从 `flowNodeResponse` 里吸收真实 token 数（仅 chatNode 节点）。"""
@@ -142,13 +148,14 @@ class _Stats:
 
     @property
     def finish_reason(self) -> str:
-        """映射成规范的 `finish_reason`（上游只有 stop/length 两种有意义）。"""
+        """映射成规范的 `finish_reason`（调了工具就是 `tool_calls`）。"""
+        if self.tool_calls:
+            return "tool_calls"
         return "length" if self.upstream_finish == "length" else "stop"
 
 
-def _handle_frame(frame: bytes, stats: _Stats, model: str,
-                  created: int) -> list[str]:
-    """处理一帧，返回要下发的 SSE 文本（无需下发时为空列表）。"""
+def _handle_frame(frame: bytes, stats: _Stats) -> list[dict[str, Any]]:
+    """处理一帧，返回要下发的 delta 字典（无需下发时为空列表）。"""
     evt = parse_event(frame)
     etype, data_str = evt["event"], evt["data"]
 
@@ -197,22 +204,26 @@ def _handle_frame(frame: bytes, stats: _Stats, model: str,
         stats.completion_chars += len(reasoning)
         stats.reasoning_chars += len(reasoning)
 
-    return [_chunk(model, created, out)]
+    return [out]
 
 
 async def translate_stream(byte_iter: AsyncIterator[bytes],
                            req: sc.ChatCompletionRequest,
                            model: str,
-                           telemetry: tm.RequestLog | None = None) -> AsyncIterator[str]:
+                           telemetry: tm.RequestLog | None = None,
+                           tool_call: bool = True) -> AsyncIterator[str]:
     """把上游字节流翻译成 OpenAI SSE 文本流。
 
     `telemetry` 非空时：首个内容分片下发时打点，流结束时（含客户端断开）打统计。
+    `tool_call` 为假时不做任何协议处理（与不带 `tools` 时行为一致）。
     """
     created = int(time.time())
-    prompt_chars = sc.count_chars(req.messages)
+    prompt_chars = sc.count_chars(req.messages) + tc.prompt_overhead(req, tool_call)
 
     stats = _Stats()
     splitter = FrameSplitter()
+    # 请求带 tools 时，正文先过一遍 `0:` / `1:` 协议过滤器
+    reply = tc.ReplyFilter(enabled=tc.enabled(req, tool_call))
 
     def tokens() -> tuple[int, int, bool]:
         """(输入, 输出, 是否估算)。上游 chatNode 统计优先。"""
@@ -230,27 +241,63 @@ async def translate_stream(byte_iter: AsyncIterator[bytes],
         if telemetry is not None:
             telemetry.mark_first_token()
 
+    def emit(delta: dict[str, Any]) -> list[str]:
+        """delta → SSE 帧；`content` 要等协议过滤器放行才下发。"""
+        frames: list[str] = []
+        reasoning = delta.get("reasoning_content")
+        if reasoning:
+            frames.append(_chunk(model, created, {"reasoning_content": reasoning}))
+        text = delta.get("content")
+        if text:
+            piece = reply.feed(text)
+            if piece.text:
+                frames.append(_chunk(model, created, {"content": piece.text}))
+        return frames
+
+    def drain() -> list[str]:
+        """流结束：吐掉过滤器残留（工具调用在这里成帧）。
+
+        工具调用要等整段 JSON 到齐才能解析，所以只能缓冲到最后；解析失败退回正文。
+        """
+        piece = reply.finish()
+        if not piece.tool_calls:
+            return [_chunk(model, created, {"content": piece.text})] if piece.text else []
+
+        stats.tool_calls = piece.tool_calls
+        stats.completion_chars += sum(len(c["function"]["arguments"]) for c in piece.tool_calls)
+        return [_chunk(model, created, {"tool_calls": [
+            {"index": i, "id": call["id"],
+             "type": "function", "function": call["function"]}
+        ]}) for i, call in enumerate(piece.tool_calls)]
+
     try:
         # 首帧：OpenAI 固定先发一个只有 role 的 delta
         yield _chunk(model, created, {"role": "assistant", "content": ""})
 
         async for raw in byte_iter:
             for frame in splitter.feed(raw):
-                for piece in _handle_frame(frame, stats, model, created):
-                    note()
-                    yield piece
+                for delta in _handle_frame(frame, stats):
+                    for piece in emit(delta):
+                        note()
+                        yield piece
 
         tail = splitter.flush()
         if tail.strip():
-            for piece in _handle_frame(tail, stats, model, created):
-                note()
-                yield piece
+            for delta in _handle_frame(tail, stats):
+                for piece in emit(delta):
+                    note()
+                    yield piece
 
         # 上游没在增量里给推理链、只在收尾统计里给了 reasoningText → 补一帧再收尾
         if stats.reasoning_fallback and not stats.reasoning_chars:
             stats.reasoning_chars = len(stats.reasoning_fallback)
             stats.completion_chars += stats.reasoning_chars
             yield _chunk(model, created, {"reasoning_content": stats.reasoning_fallback})
+
+        # 过滤器残留（工具调用帧）—— 必须在取 finish_reason 之前
+        for piece in drain():
+            note()
+            yield piece
 
         # 收尾帧：finish_reason
         yield _chunk(model, created, {}, finish_reason=stats.finish_reason)

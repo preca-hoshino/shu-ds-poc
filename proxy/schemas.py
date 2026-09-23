@@ -33,12 +33,12 @@ class MessagePartImage(BaseModel):
 
 
 class Message(BaseModel):
-    """一条对话消息。`content` 允许纯文本或分段数组两种形态。"""
+    """一条对话消息。`content` 允许纯文本、分段数组、或 null（回灌工具调用时）三种形态。"""
 
     model_config = ConfigDict(extra="allow")
 
     role: str
-    content: str | list[dict[str, Any]] = ""
+    content: str | list[dict[str, Any]] | None = ""
     name: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
     tool_call_id: str | None = None
@@ -117,11 +117,13 @@ def error_body(message: str, err_type: str = "invalid_request_error",
 
 
 def message_text(msg: Message) -> str:
-    """取一条消息的纯文本（分段消息则拼接其中的文本段）。"""
+    """取一条消息的纯文本（分段消息则拼接其中的文本段；null 视为空串）。"""
     if isinstance(msg.content, str):
         return msg.content
+    if not msg.content:
+        return ""
     parts: list[str] = []
-    for p in msg.content or []:
+    for p in msg.content:
         if isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str):
             parts.append(p["text"])
     return "".join(parts)

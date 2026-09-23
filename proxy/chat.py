@@ -18,6 +18,7 @@ from . import fastgpt as fg
 from . import schemas as sc
 from . import stream as st
 from . import telemetry as tm
+from . import toolcall as tc
 from . import transform as tf
 from .upstream import Upstream, UpstreamError
 
@@ -52,25 +53,28 @@ def _canonical_model(req: sc.ChatCompletionRequest) -> str:
 
 def _log_ignored(req: sc.ChatCompletionRequest) -> None:
     """把「接受但不起作用」的参数记到 debug，便于排查客户端配置。"""
-    ignored = [k for k, v in req.model_dump(exclude_none=True).items()
-               if k not in ("model", "messages", "stream", "stream_options", "user")]
+    used = ("model", "messages", "stream", "stream_options", "user",
+            "tools", "tool_choice")
+    ignored = [k for k, v in req.model_dump(exclude_none=True).items() if k not in used]
     extra = sorted(req.extra_fields)
     if ignored or extra:
         log.debug("未生效的请求参数：%s%s", ",".join(ignored),
                   f"；未知字段：{','.join(extra)}" if extra else "")
 
 
-async def acompletion(upstream: Upstream, req: sc.ChatCompletionRequest) -> dict[str, Any]:
+async def acompletion(upstream: Upstream, req: sc.ChatCompletionRequest,
+                      tool_call: bool = True) -> dict[str, Any]:
     """非流式：返回 OpenAI 响应字典。"""
     model = _canonical_model(req)
     _log_ignored(req)
 
-    prompt_chars = sc.count_chars(req.messages)
+    # 注入的工具声明也算 prompt（否则工具多时 usage 会严重低报）
+    prompt_chars = sc.count_chars(req.messages) + tc.prompt_overhead(req, tool_call)
     rl = tm.RequestLog(req.model, stream=False, messages=len(req.messages),
                        prompt_chars=prompt_chars)
     rl.input_line()
 
-    payload = tf.build_fastgpt_request(req, creds_view(upstream.creds), model)
+    payload = tf.build_fastgpt_request(req, creds_view(upstream.creds), model, tool_call)
     try:
         resp = await upstream.chat(payload)
         rl.mark_ttfb()
@@ -86,6 +90,9 @@ async def acompletion(upstream: Upstream, req: sc.ChatCompletionRequest) -> dict
 
         out = fg.to_openai_response(parsed, req.model, int(time.time()),
                                     prompt_chars=prompt_chars)
+        if tc.enabled(req, tool_call):
+            # 提示词模式：`1: {...}` 这种正文换成规范的 `tool_calls`
+            out = tc.apply_to_response(out)
     except Exception as exc:                        # noqa: BLE001
         rl.fail(type(exc).__name__)
         raise
@@ -108,7 +115,8 @@ async def _closing_bytes(resp: httpx.Response) -> AsyncIterator[bytes]:
         await resp.aclose()
 
 
-async def astream(upstream: Upstream, req: sc.ChatCompletionRequest) -> AsyncIterator[str]:
+async def astream(upstream: Upstream, req: sc.ChatCompletionRequest,
+                  tool_call: bool = True) -> AsyncIterator[str]:
     """流式：返回 SSE 文本的异步生成器。
 
     上游的 HTTP 错误在这一步（还没开始发 SSE）就抛出，因此能被转成正常的 JSON 错误响应；
@@ -117,16 +125,17 @@ async def astream(upstream: Upstream, req: sc.ChatCompletionRequest) -> AsyncIte
     model = _canonical_model(req)
     _log_ignored(req)
 
-    prompt_chars = sc.count_chars(req.messages)
+    prompt_chars = sc.count_chars(req.messages) + tc.prompt_overhead(req, tool_call)
     rl = tm.RequestLog(req.model, stream=True, messages=len(req.messages),
                        prompt_chars=prompt_chars)
     rl.input_line()
 
-    payload = tf.build_fastgpt_request(req, creds_view(upstream.creds), model)
+    payload = tf.build_fastgpt_request(req, creds_view(upstream.creds), model, tool_call)
     try:
         resp = await upstream.chat(payload)
     except Exception as exc:                        # noqa: BLE001
         rl.fail(type(exc).__name__)
         raise
     rl.mark_ttfb()
-    return st.translate_stream(_closing_bytes(resp), req, model=req.model, telemetry=rl)
+    return st.translate_stream(_closing_bytes(resp), req, model=req.model,
+                               telemetry=rl, tool_call=tool_call)

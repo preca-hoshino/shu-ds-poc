@@ -31,6 +31,7 @@ from proxy import fastgpt as fg                          # noqa: E402
 from proxy import schemas as sc                          # noqa: E402
 from proxy import stream as st                           # noqa: E402
 from proxy import telemetry as tm                        # noqa: E402
+from proxy import toolcall as tc                         # noqa: E402
 from proxy import transform as tf                        # noqa: E402
 from proxy import upstream as up_mod                     # noqa: E402
 import sso                                               # noqa: E402
@@ -148,6 +149,15 @@ def test_request_schema() -> None:
     check("分段消息可解析", isinstance(parts.messages[0].content, list))
     check("字符数统计含文本段", sc.count_chars(parts.messages) == 2,
           str(sc.count_chars(parts.messages)))
+
+    # 回灌工具调用时 assistant 的 content 就是 null（OpenAI 客户端真实形状）
+    backfill = _request(messages=[{"role": "assistant", "content": None,
+                                   "tool_calls": [{"id": "call_1", "type": "function",
+                                                    "function": {"name": "f",
+                                                                 "arguments": "{}"}}]}])
+    check("content 允许 null", backfill.messages[0].content is None)
+    check("null 正文算 0 字符", sc.count_chars(backfill.messages) == 0,
+          str(sc.count_chars(backfill.messages)))
 
     err = sc.error_body("boom", code="c", param="p")
     check("错误体含规范四字段",
@@ -472,6 +482,302 @@ def test_stream_reasoning() -> None:
           "分段正文" in [t for t in texts if t], str(texts))
 
 
+def _tools() -> list[dict]:
+    """一个最小工具声明（规范形状）。"""
+    return [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "查天气",
+            "parameters": {"type": "object",
+                           "properties": {"city": {"type": "string"}},
+                           "required": ["city"]},
+        },
+    }]
+
+
+def test_toolcall_protocol() -> None:
+    """[14] 提示词工具调用：注入 / 改写 / 解析。
+
+    上游是应用级接口，客户端传的 `tools` 无处可去（见 README「上游的原生 tool call」）。
+    代理把工具声明折进 system，让模型按 `0:` / `1:` 协议输出，再解析回规范 `tool_calls`。
+    """
+    print("\n[14] 提示词工具调用：注入 / 改写 / 解析")
+    tools = _tools()
+
+    specs = tc.tool_specs(tools)
+    check("工具声明只留 name/description/parameters",
+          specs and set(specs[0]) == {"name", "description", "parameters"}, str(specs))
+    check("缺 name 的声明被丢掉", tc.tool_specs([{"type": "function"}]) == [])
+
+    prompt = tc.build_tool_prompt(tools)
+    check("协议说明含工具名与参数 schema",
+          "get_weather" in prompt and '"city"' in prompt, prompt[:80])
+    check("协议说明讲清 0/1 与回灌标记",
+          "0:" in prompt and "1:" in prompt and "<ToolResponse>" in prompt)
+    check("示例里的 JSON 花括号没有被转义",
+          '1: {"name": "get_weather", "arguments": {"city": "杭州"}}' in prompt,
+          prompt[-260:])
+    # 提示词要「倾向使用工具」，否则模型会拿常识作答而不调工具
+    check("协议说明鼓励优先调用工具",
+          "优先调用工具" in prompt and "必须调用工具" in prompt, prompt[:400])
+    check("保留「与工具无关才直接回答」的出口",
+          "明显无关" in prompt, prompt[-320:])
+
+    req = _request(tools=tools, messages=[
+        {"role": "system", "content": "你是助手"},
+        {"role": "user", "content": "杭州天气"},
+        {"role": "assistant", "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "get_weather", "arguments": '{"city": "杭州"}'}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "晴 31℃"},
+    ])
+    pairs = tc.rewrite_messages(req.messages, tools)
+    check("system 追加协议说明且原内容保留",
+          pairs[0][0] == "system" and pairs[0][1].startswith("你是助手")
+          and tc.MARKER in pairs[0][1], pairs[0][1][:60])
+    check("assistant 的 tool_calls 还原成 `1: {...}`",
+          pairs[2][1].startswith("1: ")
+          and json.loads(pairs[2][1][3:]) == {"name": "get_weather",
+                                              "arguments": {"city": "杭州"}},
+          pairs[2][1])
+    check("tool 角色改成 user + <ToolResponse>",
+          pairs[3][0] == "user"
+          and pairs[3][1] == "<ToolResponse>\n晴 31℃\n</ToolResponse>", pairs[3][1])
+    check("没有 system 时自动补一条",
+          tc.rewrite_messages([sc.Message(role="user", content="hi")], tools)[0][0] == "system")
+    check("已注入过就不重复注入",
+          tc.rewrite_messages([sc.Message(role="system", content=tc.MARKER)],
+                              tools)[0][1] == tc.MARKER)
+
+    # 真实回灌形状：content 是 null + tool_calls
+    backfill = _request(tools=tools, messages=[
+        {"role": "user", "content": "杭州天气"},
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "get_weather", "arguments": '{"city": "杭州"}'}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "晴 31℃"},
+    ])
+    pairs_null = tc.rewrite_messages(backfill.messages, tools)
+    # 没有 system → 会自动补一条在头部，所以 assistant / tool 顺延一格
+    check("content=null 的工具回灌也能改写",
+          pairs_null[2][1].startswith("1: ") and pairs_null[3][1].startswith("<ToolResponse>"),
+          str([(r, str(c)[:40]) for r, c in pairs_null]))
+    check("content=null 的请求能过 transform（不炸）",
+          tf.build_fastgpt_request(backfill, {"share_id": "s"}, "deepseek-v3") is not None)
+
+    up = tf.build_fastgpt_request(_request(tools=tools), {"share_id": "s"}, "deepseek-v3")
+    check("上游请求里真的带上了协议说明",
+          up.messages[0].role == "system" and tc.MARKER in up.messages[0].content)
+    plain = tf.build_fastgpt_request(_request(), {"share_id": "s"}, "deepseek-v3")
+    check("没带 tools 时不动消息（回归）",
+          tc.MARKER not in plain.messages[0].content, plain.messages[0].content)
+
+    one = tc.parse_reply('1: {"name": "get_weather", "arguments": {"city": "杭州"}}')
+    check("`1:` 解析成 tool_calls",
+          one.tool_calls and one.tool_calls[0]["function"]["name"] == "get_weather"
+          and one.tool_calls[0]["type"] == "function", str(one))
+    check("arguments 是 JSON 字符串（规范要求）",
+          json.loads(one.tool_calls[0]["function"]["arguments"]) == {"city": "杭州"})
+    check("tool_call 带 call_* 形式的 id", one.tool_calls[0]["id"].startswith("call_"))
+
+    check("`0:` 剥掉前缀", tc.parse_reply("0: 今天晴").answer == "今天晴")
+    check("全角冒号也认",
+          bool(tc.parse_reply('1：{"name": "f", "arguments": {}}').tool_calls))
+    check("没有前缀时原样返回", tc.parse_reply("今天晴").answer == "今天晴")
+    check("`0.5 个` 这类正文不被误剥", tc.parse_reply("0.5 个").answer == "0.5 个")
+    check("`1. 首先` 这类正文不被误剥", tc.parse_reply("1. 首先").answer == "1. 首先")
+    check("`1 个苹果` 这种量词不被误剥", tc.parse_reply("1 个苹果").answer == "1 个苹果")
+    # 压测实测（210 工具档 1/112）：模型偶尔漏写冒号 `1 {json}`
+    check("漏写冒号的 `1 {json}` 也认",
+          bool(tc.parse_reply('1 {"name": "f", "arguments": {"a": 1}}').tool_calls))
+    check("漏写冒号且参数名写成 parameters 也认",
+          json.loads(tc.parse_reply('1 {"name": "f", "parameters": {"a": 1}}')
+                     .tool_calls[0]["function"]["arguments"]) == {"a": 1})
+    check("`0 {json}` 不加冒号时不算调用", tc.parse_reply('0 {"a": 1}').tool_calls is None)
+    check("围栏 JSON 能解析",
+          tc.parse_reply('1: ```json\n{"name": "f", "arguments": {"a": 1}}\n```')
+          .tool_calls[0]["function"]["name"] == "f")
+    check("JSON 前后有废话也能抠出来",
+          bool(tc.parse_reply('1: 好的 {"name": "f", "arguments": {}}').tool_calls))
+    check("arguments 是字符串时也能吃下",
+          json.loads(tc.parse_reply('1: {"name": "f", "arguments": "{\\"a\\": 1}"}')
+                     .tool_calls[0]["function"]["arguments"]) == {"a": 1})
+    check("一次给多个调用", len(tc.parse_reply(
+        '1: [{"name": "a", "arguments": {}}, {"name": "b", "arguments": {}}]'
+    ).tool_calls) == 2)
+    check("JSON 坏了退回正文（不丢内容）",
+          tc.parse_reply("1: {不是 json").answer == "{不是 json")
+    check("名字缺失时不算调用", tc.parse_reply('1: {"arguments": {}}').tool_calls is None)
+
+    check("有 tools 默认启用", tc.enabled(_request(tools=tools)) is True)
+    check("tool_choice=none 关掉",
+          tc.enabled(_request(tools=tools, tool_choice="none")) is False)
+    check("没 tools 时不启用", tc.enabled(_request()) is False)
+
+    # 注入的协议说明要计入 prompt 估算，否则工具多时 usage 严重低报
+    check("prompt_overhead 反映了注入量",
+          tc.prompt_overhead(_request(tools=tools)) == len(tc.build_tool_prompt(tools))
+          and tc.prompt_overhead(_request(tools=tools)) > 100,
+          str(tc.prompt_overhead(_request(tools=tools))))
+    check("没 tools 时 overhead 为 0", tc.prompt_overhead(_request()) == 0)
+    many = _tools() * 20
+    one_cost = tc.prompt_overhead(_request(tools=_tools()))
+    many_cost = tc.prompt_overhead(_request(tools=many))
+    # 模板底数固定，多出来的就是工具声明的 JSON（`per_tool` 含一对方括号，故减 1）
+    per_tool = len(json.dumps(tc.tool_specs(_tools()), ensure_ascii=False,
+                              separators=(",", ":")))
+    check("每多一个工具，overhead 就多一份工具声明",
+          many_cost - one_cost == 19 * (per_tool + 1) - 38,
+          f"增量 {many_cost - one_cost}，预期 {19 * (per_tool - 1)}")
+
+    # 服务端开关（poc.py --no-tool-call）关闭时，整条链路回到「接受但忽略」
+    check("服务端开关关闭时不启用",
+          tc.enabled(backfill, tool_call=False) is False)
+    check("服务端开关关闭时 overhead 为 0",
+          tc.prompt_overhead(backfill, tool_call=False) == 0)
+    off = tf.build_fastgpt_request(backfill, {"share_id": "s"}, "deepseek-v3",
+                                  tool_call=False)
+    check("开关关闭时不注入协议说明",
+          tc.MARKER not in "".join(str(m.content) for m in off.messages),
+          [str(m.content)[:40] for m in off.messages])
+    check("开关关闭时 tool 消息不被改写",
+          [m.role for m in off.messages] != ["system", "user", "assistant", "user"]
+          or "<ToolResponse>" not in str(off.messages[-1].content),
+          [m.role for m in off.messages])
+
+    resp = fg.to_openai_response(fg.FastGptResponse.model_validate({"choices": [{"message": {
+        "content": '1: {"name": "get_weather", "arguments": {"city": "杭州"}}'}}]}),
+        "deepseek-v3", 1, prompt_chars=10)
+    out = tc.apply_to_response(resp)
+    choice = out["choices"][0]
+    check("非流式：message.content 变 null",
+          choice["message"]["content"] is None, str(choice["message"]))
+    check("非流式：message 带 tool_calls",
+          choice["message"]["tool_calls"][0]["function"]["name"] == "get_weather")
+    check("非流式：finish_reason=tool_calls", choice["finish_reason"] == "tool_calls")
+    check("非流式：顶层字段没多没少", set(out) == RESPONSE_KEYS, str(sorted(out)))
+
+    resp0 = fg.to_openai_response(fg.FastGptResponse.model_validate(
+        {"choices": [{"message": {"content": "0: 今天晴"}}]}),
+        "deepseek-v3", 1, prompt_chars=10)
+    tc.apply_to_response(resp0)
+    check("非流式：`0:` 只剥前缀、不加 tool_calls",
+          resp0["choices"][0]["message"]["content"] == "今天晴"
+          and "tool_calls" not in resp0["choices"][0]["message"],
+          str(resp0["choices"][0]["message"]))
+
+
+def test_toolcall_stream() -> None:
+    """[15] 提示词工具调用的流式帧。
+
+    两个关键点：工具协议不能漏进可见正文；`1:` 要跨分片缓冲到 JSON 完整才能解析。
+    """
+    print("\n[15] 提示词工具调用的流式帧")
+
+    def frames(chunks: list[str]) -> list[dict]:
+        raw = ("".join(f"event: answer\ndata: {json.dumps({'choices': [{'delta': {'content': c}}]})}\n\n"
+                        for c in chunks) + "event: answer\ndata: [DONE]\n\n").encode()
+        req = sc.ChatCompletionRequest.model_validate({
+            "model": "deepseek-v3", "messages": [{"role": "user", "content": "hi"}],
+            "stream": True, "tools": _tools()})
+        out = asyncio.run(_collect_req(raw, req))
+        return [json.loads(x[6:]) for x in out if x.startswith("data: {")]
+
+    def deltas(payloads: list[dict]) -> list[dict]:
+        return [p["choices"][0]["delta"] for p in payloads if p["choices"]]
+
+    # 1) `1:` 跨三个分片 → 只出 tool_calls 帧，正文为空
+    payloads = frames(['1: {"name": "get_', 'weather", "arguments": {"city"', ': "杭州"}}'])
+    ds = deltas(payloads)
+    text = "".join(d.get("content") or "" for d in ds)
+    check("协议标记不漏进正文", text == "", repr(text))
+
+    calls = [d["tool_calls"][0] for d in ds if d.get("tool_calls")]
+    check("流式出一条 tool_calls 帧", len(calls) == 1, str(ds))
+    check("流式 tool_calls 带 index/id/type",
+          calls and calls[0]["index"] == 0 and calls[0]["id"].startswith("call_")
+          and calls[0]["type"] == "function", str(calls))
+    check("流式 tool_calls 名字与参数正确",
+          calls and calls[0]["function"]["name"] == "get_weather"
+          and json.loads(calls[0]["function"]["arguments"]) == {"city": "杭州"})
+
+    finishes = [p["choices"][0]["finish_reason"] for p in payloads if p["choices"]]
+    check("finish_reason=tool_calls 且不出 stop",
+          finishes.count("tool_calls") == 1 and "stop" not in finishes, str(finishes))
+    check("tool_calls 帧排在收尾帧之前",
+          ds.index(next(d for d in ds if d.get("tool_calls"))) < len(ds) - 1, str(ds))
+
+    # 2) `0:` 跨分片 → 剥掉前缀后正文照常流
+    payloads = frames(["0", ": 今天", "杭州晴"])
+    text = "".join(d.get("content") or "" for d in deltas(payloads))
+    check("`0:` 前缀被剥掉且正文完整", text == "今天杭州晴", repr(text))
+    check("文本回复仍然是 stop",
+          [p["choices"][0]["finish_reason"] for p in payloads
+           if p["choices"]][-1] == "stop")
+
+    # 3) 模型没按协议来 → 原样流出
+    payloads = frames(["今天", "杭州晴"])
+    text = "".join(d.get("content") or "" for d in deltas(payloads))
+    check("不按协议时原样透传", text == "今天杭州晴", repr(text))
+
+    # 4) 工具 JSON 没解析成功 → 退回正文（不吞内容）
+    payloads = frames(["1: {不是 json"])
+    text = "".join(d.get("content") or "" for d in deltas(payloads))
+    check("解析失败时退回正文", text == "{不是 json", repr(text))
+
+    # 5) 没带 tools → 不做任何加工（回归）
+    raw = (f"event: answer\ndata: {json.dumps({'choices': [{'delta': {'content': '0: 今天晴'}}]})}\n\n"
+           "event: answer\ndata: [DONE]\n\n").encode()
+    req = sc.ChatCompletionRequest.model_validate({
+        "model": "deepseek-v3", "messages": [{"role": "user", "content": "hi"}],
+        "stream": True})
+    out = asyncio.run(_collect_req(raw, req))
+    text = "".join((json.loads(x[6:])["choices"][0]["delta"].get("content") or "")
+                   for x in out if x.startswith("data: {")
+                   and json.loads(x[6:])["choices"])
+    check("没带 tools 时不剥前缀（回归）", text == "0: 今天晴", repr(text))
+
+    # 6) 带 tools 但服务端开关关闭 → 同样不做加工（`--no-tool-call`）
+    raw6 = (f"event: answer\ndata: {json.dumps({'choices': [{'delta': {'content': '1: {\\"name\\": \\"f\\"}'}}]})}\n\n"
+            "event: answer\ndata: [DONE]\n\n").encode()
+    req6 = sc.ChatCompletionRequest.model_validate({
+        "model": "deepseek-v3", "messages": [{"role": "user", "content": "hi"}],
+        "stream": True, "tools": _tools()})
+    out6_steps = []
+
+    async def _collect_off() -> None:
+        async for x in st.translate_stream(st.iter_stream_text(raw6.decode()),
+                                          req6, model=req6.model, tool_call=False):
+            out6_steps.append(x)
+
+    asyncio.run(_collect_off())
+    out6 = out6_steps
+    payloads6 = [json.loads(x[6:]) for x in out6 if x.startswith("data: {")]
+    text6 = "".join(p["choices"][0]["delta"].get("content") or ""
+                    for p in payloads6 if p["choices"])
+    check("开关关闭时正文原样透传（不剥前缀）", text6.startswith("1: "), repr(text6))
+    check("开关关闭时不出 tool_calls",
+          not any(p["choices"] and p["choices"][0]["delta"].get("tool_calls")
+                  for p in payloads6), str(payloads6))
+    check("开关关闭时 finish_reason 仍为 stop",
+          [p["choices"][0]["finish_reason"] for p in payloads6
+           if p["choices"]][-1] == "stop")
+
+    # 7) 漏写冒号（`1 {json}`）在流式下也要缓冲成调用，不能漏进正文
+    payloads7 = frames(["1 ", '{"name": "get_weather", ',
+                        '"arguments": {"city": "杭州"}}'])
+    ds7 = deltas(payloads7)
+    text7 = "".join(d.get("content") or "" for d in ds7)
+    check("漏写冒号时正文仍为空", text7 == "", repr(text7))
+    check("漏写冒号也能出 tool_calls",
+          any(d.get("tool_calls") and d["tool_calls"][0]["function"]["name"] == "get_weather"
+              for d in ds7), str(ds7))
+    check("漏写冒号时 finish_reason 仍是 tool_calls",
+          [p["choices"][0]["finish_reason"] for p in payloads7
+           if p["choices"]][-1] == "tool_calls")
+
+
 class _AsyncGenStream(httpx.AsyncByteStream):
     """把异步生成器包成 httpx 的流（`MockTransport` 不认裸生成器）。"""
 
@@ -560,6 +866,12 @@ def test_upstream_streaming() -> None:
           exc is not None and exc.status_code == 403 and "forbidden" in exc.body, repr(exc))
 
 
+async def _collect_req(raw: bytes, req: sc.ChatCompletionRequest) -> list[str]:
+    """按给定请求收集流式 SSE 文本。"""
+    return [x async for x in st.translate_stream(st.iter_stream_text(raw.decode()),
+                                                req, model=req.model)]
+
+
 async def _collect(raw: bytes, include_usage: bool) -> list[str]:
     req = sc.ChatCompletionRequest.model_validate({
         "model": "deepseek-v3",
@@ -567,8 +879,7 @@ async def _collect(raw: bytes, include_usage: bool) -> list[str]:
         "stream": True,
         **({"stream_options": {"include_usage": True}} if include_usage else {}),
     })
-    return [x async for x in st.translate_stream(st.iter_stream_text(raw.decode()),
-                                                req, model=req.model)]
+    return await _collect_req(raw, req)
 
 
 class _Capture(logging.Handler):
@@ -772,6 +1083,8 @@ def main() -> int:
     test_stream_reasoning()
     test_upstream_streaming()
     test_telemetry()
+    test_toolcall_protocol()
+    test_toolcall_stream()
     test_sso_submodule()
 
     print()

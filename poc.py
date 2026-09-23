@@ -4,9 +4,10 @@
 
     读凭据 → 起 FastAPI → POST /v1/chat/completions → 转换 → 上游 → 转回 OpenAI
 
-只暴露 `POST /v1/chat/completions` 与 `GET /v1/models`。
+只暴露 `POST /v1/chat/completions` 与 `GET /v1/models`。客户端带 `tools` 时，
+默认走提示词模式（上游不支持 tools，见 `proxy/toolcall.py`），可用 `--no-tool-call` 关掉。
 
-用法: python poc.py [--port 8080 --host 0.0.0.0]
+用法: python poc.py [--port 8080 --host 0.0.0.0] [--no-tool-call]
 """
 
 from __future__ import annotations
@@ -61,6 +62,9 @@ def banner(args, creds: dict) -> None:
           f"  生成于 {creds_mod.summarize_age(creds)}  Cookie {cookie_items} 项")
     print(f" 监听     : http://{args.host}:{args.port}")
     print(f" API Key  : {args.api_key}")
+    print(f" 工具调用 : "
+          + ("提示词模式（上游不支持 tools，代理折进 system。）" if args.tool_call
+             else "关闭（tools 接受但忽略）"))
     print(" 端点     : POST /v1/chat/completions")
     print("           GET  /v1/models")
     print(" 遥测     : 每个请求打印输入状态与输出统计（tokens / TPS / 耗时）")
@@ -87,6 +91,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=300.0, help="上游请求超时秒数")
     p.add_argument("--insecure", action="store_true",
                    help="跳过上游 TLS 证书校验（默认校验）")
+    p.add_argument("--tool-call", action=argparse.BooleanOptionalAction, default=True,
+                   help="提示词模式的工具调用：上游不支持 tools，代理把它折进 system "
+                        "提示词再把 1: 输出解析回 tool_calls（默认开启；"
+                        "--no-tool-call 则只接受 tools 并忽略）")
     p.add_argument("--log-level", default="info",
                    choices=["critical", "error", "warning", "info", "debug", "trace"])
     p.add_argument("--access-log", action="store_true", help="打印每条请求的访问日志")
@@ -116,7 +124,8 @@ def main() -> int:
         return 2
 
     app = server_mod.make_app(creds, api_key=args.api_key, base=args.base,
-                              timeout=args.timeout, verify=not args.insecure)
+                              timeout=args.timeout, verify=not args.insecure,
+                              tool_call=args.tool_call)
     setup_logging(args.log_level)
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level,
                 access_log=args.access_log)

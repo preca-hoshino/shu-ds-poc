@@ -38,12 +38,15 @@ class Config:
     """服务端配置（在 `create_app` 时固定）。"""
 
     def __init__(self, creds: dict, api_key: str, base: str | None = None,
-                 timeout: float = 300.0, verify: bool = True) -> None:
+                 timeout: float = 300.0, verify: bool = True,
+                 tool_call: bool = True) -> None:
         self.creds = creds
         self.api_key = api_key
         self.base = base
         self.timeout = timeout
         self.verify = verify
+        #: 提示词模式的工具调用开关（上游不支持 `tools`，详见 `proxy/toolcall.py`）
+        self.tool_call = tool_call
 
 
 def _validation_message(exc: ValidationError) -> tuple[str, str | None]:
@@ -62,6 +65,8 @@ def create_app(cfg: Config) -> FastAPI:
         app.state.upstream = Upstream(cfg.creds, base=cfg.base, timeout=cfg.timeout,
                                       verify=cfg.verify)
         log.info("上游: %s", app.state.upstream.url)
+        log.info("工具调用（提示词模式）: %s",
+                 "开启" if cfg.tool_call else "关闭（tools 接受但忽略）")
         try:
             yield
         finally:
@@ -132,10 +137,11 @@ def create_app(cfg: Config) -> FastAPI:
 
         upstream: Upstream = request.app.state.upstream
         if req.stream:
-            gen = await chat_mod.astream(upstream, req)
+            gen = await chat_mod.astream(upstream, req, cfg.tool_call)
             return StreamingResponse(gen, media_type="text/event-stream",
                                      headers=_SSE_HEADERS)
-        return JSONResponse(content=await chat_mod.acompletion(upstream, req))
+        return JSONResponse(content=await chat_mod.acompletion(upstream, req,
+                                                              cfg.tool_call))
 
     @app.get("/v1/models", dependencies=[Depends(require_key)])
     async def models() -> dict[str, Any]:
