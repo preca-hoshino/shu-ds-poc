@@ -2,14 +2,11 @@
 
 # SHU DeepSeek POC
 
-上海大学校内 DeepSeek 服务（千学百科，`ds.shu.edu.cn`）的 OpenAI 兼容代理 ——
-**一次登录产出凭据，一条命令起服务，任何 OpenAI 客户端可直接接入**
+上海大学校内 DeepSeek 服务（千学百科，`ds.shu.edu.cn`）的 OpenAI 兼容代理
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![API](https://img.shields.io/badge/API-OpenAI%20compatible-412991?logo=openai&logoColor=white)](https://platform.openai.com/docs/api-reference)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-
-仓库：<https://github.com/preca-hoshino/shu-ds-poc>
 
 </div>
 
